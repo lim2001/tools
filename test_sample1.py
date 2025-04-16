@@ -1,5 +1,5 @@
 """
-This is example2.py
+This is test_sample1.py
 """
 
 # Copyright (c) 2025 Orbbec 3D Technology, Inc
@@ -16,14 +16,14 @@ This is example2.py
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import rclpy
 import time
 from rclpy.node import Node
 from std_msgs.msg import String
-
 import datetime
 
-description = "This is example2.py"
+description = "This is example1.py"
 
 debug_enable =1
 
@@ -35,7 +35,6 @@ def print_debug(*args, **kwargs):
     timestamp = datetime.datetime.now().strftime("[%m %H:%M:%S.%f")[:-3]+ "]"
     print(timestamp, *args, **kwargs)
 
-
 def func():
 
     print_debug(f"{description}")
@@ -43,9 +42,6 @@ def func():
     now = datetime.datetime.now()
     formatted_now = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     print_debug("format time: ",formatted_now)
-
-
-
 
 
 if __name__ == '__main__':

@@ -38,7 +38,7 @@ class ListPythonFiles:
                 description = self.get_file_description(file_path)
 
                 if description:
-                    file_info = f"{file_name:<16}  -- {description}"
+                    file_info = f"{file_name:<25}  -- {description}"
                 else:
                     file_info = f"{file_name}"
 
