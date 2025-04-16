@@ -1,0 +1,503 @@
+# ~/.bash_aliases: executed by bash(1) when login shell exits.
+
+# add follow if fi in you .zshrc, then source .zshrc
+# if [ -f ~/.bash_aliases ]; then
+#     . ~/.bash_aliases
+# fi
+
+
+
+
+
+#######################################
+process_command=0
+
+export ORBBEC_SHELL_PATH=~/robot_kit/robot_sdk/tools/assist/shell_cli.py
+
+function preexec() {
+	local cmd=$1
+	python3  $ORBBEC_SHELL_PATH "$cmd"
+	process_command=$?  
+	return 0
+}
+
+function command_not_found_handler() {
+    local input="$1"
+    if [[ -f "$input" && "$input" == *.py ]]; then
+        python_file=$input
+		echo "python $python_file" 
+        python "$python_file"
+		return 0  #返回0 命令已处理
+    fi
+
+	if [[ $process_command -eq 0 ]]; then
+		echo "command not found:  $input" 
+		return 1
+	fi
+}
+#######################################
+alias hiall='history'	# 查看历史信息
+alias cl='clear && echo "clear ------------------------------------------ " ' # 清屏
+
+alias py='python3'
+alias ro='ros2'
+
+alias grepp='grep $1 -rn --exclude-dir={build,install,log,.git} --exclude=*.{so,lib}'
+alias gre='grep $1 -rn --exclude-dir={build,install,log,.git}'
+
+alias findd='find . -name $1'
+alias fin='find . -name $1'
+
+test1() {
+	echo "{test1: $@}"
+    echo "{test1: $1}"
+    echo "{test1: $2}"
+    echo "{test1: $#2}"
+}
+######################
+search_history() {
+    local pattern=$1
+    # 检查输入是否包含星号
+    #if [[ $pattern == *'*'* ]]; then
+        # 使用history命令搜索匹配的指令
+        local search_pattern="${pattern//\*/.*}"
+        local keyword=$(echo "$pattern" | tr -d '*')
+
+		# 从末尾逆序开始搜索历史文件
+        local history_output=$(history | tail -n 1000 | grep -i -- "$search_pattern" | head -n 1000 | tac | sed -E "s/($keyword)/\x1b\[32m\1\x1b\[0m/gi")
+		#echo "$history_output" | head -n 10
+
+		#local no_number_history_output=$(echo "$history_output" | awk '{print substr($0, index($0, $2))}' | tac)		
+		local no_number_history_output=$(echo "$history_output" | awk '{print substr($0, index($0, $2))}')
+		local unique_history_output=$(echo "$no_number_history_output" | awk '!seen[$0]++')
+		#echo "$unique_history_output"
+
+		local final_history_output=$(echo "$unique_history_output" | awk '{print NR "  " $0}' | head -n 20)
+		echo "$final_history_output"
+		echo
+		echo "$final_history_output" > ~/.match_history_cmd.txt		
+		
+    #else
+    #    echo "输入的字符串不包含星号，无法进行模糊搜索。"
+    #fi
+}
+# 绑定函数到一个别名
+alias shss='noglob search_history'
+
+######################
+history_20() {
+    local history_output=$(history | tail -n 200)
+    #echo "$history_output"
+    #local no_number_history_output=$(echo "$history_output" | awk '{print substr($0, index($0, $2))}')
+	local no_number_history_output=$(echo "$history_output" | awk '{print substr($0, index($0, $2))}' | tac)
+    local unique_history_output=$(echo "$no_number_history_output" | awk '!seen[$0]++')
+    #echo "$unique_history_output"
+	#local final_history_output=$(echo "$unique_history_output" | tac | awk '{print NR "  " $0}' | head -n 30)
+	local final_history_output=$(echo "$unique_history_output" | awk '{print NR "  " $0}' | head -n 30)
+    echo "$final_history_output"
+    echo
+    echo "$final_history_output" > ~/.auto_history_cmd.txt
+    #echo "save ~/.auto_history_cmd.txt"
+}
+
+alias shh20='history_20'
+
+######################
+
+
+#auto history
+auto_history() {
+	if [ $# -eq 0 ]; then
+		history_20
+	elif [ $# -eq 1 ]; then  
+		local input=$1
+		
+		if [[ $input =~ '^[1-9][0-9]?$' ]]; then
+			    local command_file=~/.auto_history_cmd.txt
+				local line_number=$input
+				if [[ ! -f "$command_file" ]]; then
+					echo "文件 $command_file 不存在。"
+				fi
+
+				local command=$(sed -n "${line_number}p" "$command_file")
+				if [[ -z "$command" ]]; then
+					echo "无法读取文件的第 $line_number 行。"
+				fi
+				command=$(echo "$command" | sed 's/^[0-9]*  *//')
+				command=$(echo "$command" | sed 's/\x1b\[[0-9;]*m//g')
+				#echo "$command"
+				# 将命令刷新到当前终端的输入状态
+				# echo -n "$command"
+				# read -rs  # 缓存不立即执行
+
+				echo "$command"  
+				echo
+				print -s "$command"
+				eval "$command"
+
+		else
+			# 使用history命令搜索匹配的指令
+			local search_pattern="${input//\*/.*}"
+			local keyword=$(echo "$input" | tr -d '*')
+
+			# 从末尾逆序开始搜索历史文件
+			local history_output=$(history | tail -n 3000 | grep -i -- "$search_pattern" | head -n 3000 | tac | sed -E "s/($keyword)/\x1b\[32m\1\x1b\[0m/gi")
+			#echo "$history_output" | head -n 10
+
+			#local no_number_history_output=$(echo "$history_output" | awk '{print substr($0, index($0, $2))}' | tac)		
+			local no_number_history_output=$(echo "$history_output" | awk '{print substr($0, index($0, $2))}')
+			local unique_history_output=$(echo "$no_number_history_output" | awk '!seen[$0]++')
+			#echo "$unique_history_output"
+
+			local final_history_output=$(echo "$unique_history_output" | awk '{print NR "  " $0}' | head -n 20)
+			#echo "$final_history_output"
+			echo "$final_history_output" > ~/.auto_history_cmd.txt		
+			######
+			local history_output=$(history | tail -n 80)
+			#echo "$history_output"
+			local no_number_history_output=$(echo "$history_output" | awk '{print substr($0, index($0, $2))}' | tac)
+			local unique_history_output=$(echo "$no_number_history_output" | awk '!seen[$0]++')
+			#echo "$unique_history_output"
+			local line_count=$(echo "$final_history_output" | wc -l)
+			#echo "Number of unique history entries: $line_count"
+			local final_history_output=$(echo "$unique_history_output" | awk -v start="$line_count" '{print (NR + start) "  " $0}' | head -n 10)
+			echo "---------------"
+			echo "$final_history_output" >> ~/.auto_history_cmd.txt
+			#echo "$final_history_output"	
+			cat ~/.auto_history_cmd.txt
+		fi
+	else
+		history_20
+	fi
+
+}
+alias shl='noglob auto_history'
+alias shh='noglob auto_history'
+#######################################
+alias ro='ros2'
+alias ros='ros2'
+
+alias to='topic'  #topic
+alias se='service'  #service
+alias no='node'
+alias ru='run'
+alias la='launch'
+alias pa='param'
+
+#alias to='ros2 topic'  #topic
+#alias se='ros2 service'  #service
+#alias no='ros2 node'   #node
+#alias ru='ros2 run'
+#alias la='ros2 launch'
+#alias pa='ros2 param'
+
+#alias topi='ros2 topic'
+#alias ser='ros2 service'
+#alias nod='ros2 node'
+#alias run='ros2 run'
+#alias lau='ros2 launch'
+#alias par='ros2 param'
+
+#alias topic='ros2 topic'
+alias service='ros2 service'
+#alias node='ros2 node'
+#alias run='ros2 run'
+#alias launch='ros2 launch'
+#alias param='ros2 param'
+
+alias autobuild='./autobuild.sh'
+alias build='colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release --symlink-install  --packages-up-to '
+#######################################
+tmp() {
+	if [ $# -eq 0 ]; then
+		echo "ros2 topic list -v:"
+		ros2 topic list -v
+		echo
+		sh
+	elif [ $# -eq 1 ]; then  
+		echo "ros2 topic list -v:"
+		ros2 topic list -v	
+		echo		
+		ros2 topic $@
+		echo
+		menu_topic
+	else
+		ros2 topic $@
+	fi
+}
+
+
+#############################
+node() {
+	if [ $# -eq 0 ]; then
+		echo "ros2 node list:"
+		ros2 node list
+		echo
+		menu_node
+	else
+		ros2 node $@
+		echo
+		menu_node
+	fi
+}
+topic() {
+	if [ $# -eq 0 ]; then
+		echo "ros2 topic list -v:"
+		ros2 topic list -v
+		echo
+		menu_topic
+	elif [ $# -eq 1 ]; then  
+		echo "ros2 topic list -v:"
+		ros2 topic list -v	
+		echo		
+		ros2 topic $@
+		echo
+		menu_topic
+	else
+		ros2 topic $@
+	fi
+}
+param() {
+	if [ $# -eq 0 ]; then
+		menu_param
+	elif [ $# -eq 1 ] && [ "$1" = "dump" ]; then  
+		ros2 node list
+		echo
+		menu_param
+		echo
+		echo "pls choice above node name and run again: param dump + node_name"		
+	else
+		ros2 param $@
+	fi
+}
+run() {
+	if [ $# -eq 0 ]; then
+		output=$(python3 ~/robot_kit/robot_sdk/tools/assist/menu_run.py 2>&1)
+		echo "$output"
+		echo
+		menu_run
+		echo
+		echo "ros2 run <package_name> <executable_name> "		
+		echo "pls choice "		
+	else
+		ros2 run $@
+	fi
+}
+launch() {
+	if [ $# -eq 0 ]; then
+		output=$(python3  ~/robot_kit/robot_sdk/tools/assist/menu_launch.py 2>&1)
+		echo "$output"
+		echo
+		menu_launch
+		echo
+		echo "ros2 launch <package_name> <bringup.launch.py>"		
+		echo "pls choice "		
+	else
+		ros2 launch $@
+	fi
+}
+############
+menu_node() {
+	echo "node menu:"
+	echo "    node list  --- list all available node"
+	echo "    node info nodexxx --- : node info /amr"
+	echo "    node -h 、node list -h、node info -h ---  for relate cmd  details help of ros2"	
+}
+
+menu_topic() {
+	echo "topic menu:"
+	echo "    topic      --- =topic list -v  and show menu"
+	echo "    topic info  --- topic info topicxxx : topic info /shell "
+	echo "    topic echo --- topic echo topicxxx : topic echo /cam0/depth/pointcloud  --no-arr"
+	echo "    topic hz    --- topic hz topicxxx : topic hz /cam0/depth/pointcloud"
+	echo "    topic pub  --- : topic pub --once /shell std_msgs/msg/String \"{data: help}\""
+	echo "    topic type  --- "
+	echo "    topic delay --- "
+	echo "    topic bw    --- "
+	echo "    topic -h   --- add -h for relate cmd  details help of ros2"
+}
+
+menu_param() {
+	echo "param menu:"
+	echo "    param get nodexxx paramxxx --- param get /amr filter_"
+	echo "    param set nodexxx paramxxx valuexxx--- param set /amr filter_  3"
+	echo "    param dump nodexxx --- param dump /amr (or amr) 、param dump /amr > 123.yaml   "
+	echo "    param list (all) --- param list nodexxx : param list /amr  "	
+	echo "    param load <node_name> <parameter_file>"	
+	echo "    param delete  --- Delete parameter"
+	echo "    param describe  --- Show descriptive information about declared parameters"
+	echo "    Call param <command> -h for the relate cmd detailed usage."
+}
+
+menu_launch() {
+	 echo "    launch -- check all of the launch support & menu"
+	 echo "    launch <package_name> <bringup.launch.py>"		
+}
+menu_run() {
+	echo "    run  -- check all of the run support & menu"
+    echo "    run <package_name> <executable_name> "		
+    echo "    ros2 run rqt_tf_tree rqt_tf_tree --force-discover "		
+}
+#######################################
+tool() {
+	if [ $# -eq 0 ]; then
+		echo
+		menu_tool
+		echo
+		echo "pls sellect choice"		
+	else
+        if [[ $1 != *.py ]]; then
+            set -- "$1".py
+        fi
+        python3  ~/robot_kit/robot_sdk/tools/$@
+	fi
+}
+menu_tool() {
+    output=$(python3  ~/robot_kit/robot_sdk/tools/list_menu.py 2>&1)
+    # echo "$output"
+	echo "$output" | sed 's/^/    tool /'
+	echo "    tool <python.py>  --- eg. tool cpu.py"
+}
+#######################################
+# she() {
+#   ros2 topic pub --once /shelllog std_msgs/msg/String "{data: $@}"
+# }
+
+#alias sh='_goto(){ ros2 topic pub --once /shell std_msgs/msg/String "{data: $*}";};_goto'
+alias she='_goto(){ ros2 topic pub --once /shell std_msgs/msg/String "{data: $*}";};_goto'
+alias shel='_goto(){ ros2 topic pub --once /shell std_msgs/msg/String "{data: $*}";};_goto'
+alias shell='_goto(){ ros2 topic pub --once /shell std_msgs/msg/String "{data: $*}";};_goto'
+
+# ok alias sh='ros2 topic pub --once /shell std_msgs/msg/String'
+# ok alias shell='ros2 topic pub --once /shell std_msgs/msg/String'
+# ok alias she='ros2 topic pub --once /MSG_ID_0x8001 std_msgs/msg/String "{data: test4}"'
+# error alias shel='ros2 topic pub --once /MSG_ID_0x8001 std_msgs/msg/String "{data: $1}"'
+# alias sh='_goto(){ ros2 topic pub --once /shell std_msgs/msg/String "{data: $*}";};_goto'
+
+#######################################
+# shell menu
+sh() {
+echo "-------------------- shell menu  ---------------------"
+echo "[ros2]"
+echo " 1: action:  ---  action -- menu: ros2 action xxx xxx    "
+echo " 2: bag:  --- bag --- menu: ros2 bag"
+    echo "    ros2 bag record -a  -- record all topic data "	
+	echo "    ros2 bag record /topic1 /topic2 /topic3  -- record /topic1 /topic2 /topic3 "	
+	echo "    ros2 bag record -o xxx_bag /cartographer_ros/scan "
+	echo "    ros2 bag play -- start-offset 330 vl_ros2_bag/ "	
+echo " 3: component:  --- : component menu:"
+echo " 4: control:  ---  control  menu:"
+echo " 5: daemon:  ---  daemon menu:"
+echo " 6: doctor :  --- check ros setup and other potential issues"
+echo " 7: interface:  --- information about ros interfaces"
+echo " 8: launch:  --- ros2 launch pkgxxx  launch.py    :Run a launch file"
+	menu_launch
+echo " 9: lifecycle:  --- lifecycle  menu:"
+echo "10: multicast:  --- multicast  menu:"
+echo "11: node:"
+	menu_node
+echo "12: param:"
+	menu_param
+echo "13: pkg:  --- package  menu"
+echo "14: run:  --- : ros2 run pkgxxx nodexxx"
+	menu_run
+echo "15: security:  --- security menu:"
+echo "16: service:  --- service menu:"
+	echo "    service list  --- service list xxx"
+	echo "    service call --- service call  /camera/set_laser_enable std_srvs/srv/SetBool \"{data: false}\"   "
+echo "17: test:  ---     :run a ros2 launch test"
+echo "18: topic:"
+	menu_topic
+echo "19: wtf : --- :use wtf as alias to doctor"
+echo "[cust]"
+echo "20: autobuild + pkg --- eg:  ./autobuild.sh amr --- autobuild = ./autobuild.sh"
+echo "21: build + pkg --- colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release --packages-up-to "
+echo "22: colcon list --- list build pkgxxx "
+echo "23: she       ---  send shell cmd to robot , the relate sub menu would be show on its node termnal"
+echo "    she logen 4     -- self test for check"
+echo "    she selftest    -- self test for check"
+echo "    she print       -- print msg data for test"
+echo "    she log         -- log pkgxxx levelxxx, for set log level"
+echo "    she help        -- print help menu"
+echo "24: tool:"
+	menu_tool
+echo "25: shl:"
+echo "    shl       -- search history cmd, eg.  shl orbbec_cam"
+echo "    shh      -- list history cmd 20;  use history to list all "
+
+echo
+echo "example: "
+echo "topic    --- =topic list -v / topic menu"
+echo "node    --- node list  / node menu"
+echo "launch  --- list  launch menu"
+echo "launch  amr_multi_cam bringup_launch.py"
+echo "pls enter your choice"	
+echo "----------------------------------------------------------"
+}
+
+
+
+
+#######################################
+#export RCUTILS_CONSOLE_OUTPUT_FORMAT='[{severity}]{message}'    #不带时间戳
+export RCUTILS_CONSOLE_OUTPUT_FORMAT='[{severity} {time}]{message}'
+
+
+# 程序公共
+export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:/opt/ros/humble/share/turtlebot3_gazebo/models
+
+export ROS_DOMAIN_ID=55  # 两个设备互相发现 需要ROS_DOMAIN_ID 和 RMW_IMPLEMENTATION 一致
+#export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+#######################################
+#kill 功能
+ki() {
+	# 检查是否提供了关键字参数
+	if [ $# -eq 0 ]; then
+		echo "Usage: $0 <process_keyword>"
+		exit 1
+	fi
+
+	# 将关键字参数赋值给变量
+	keyword=$1
+
+	# 查找所有包含关键字的进程
+	processes=$(ps -ef | grep "$keyword" | grep -v grep | awk '{print $2}')
+
+	# 遍历进程号并杀掉它们
+	for pid in $processes; do
+		echo "Killing process with PID: $pid"
+		kill -9 "$pid"
+	done
+
+	echo "All processes containing '$keyword' have been terminated." 
+}
+
+#######################################
+# 定义一个函数来检查配置文件是否被修改
+check_and_reload_zshrc() {
+    local zshrc_file="$HOME/.bash_aliases"
+    local zshrc_last_modified_time
+
+    # 获取配置文件的最后修改时间
+    zshrc_last_modified_time=$(stat -c %Y "$zshrc_file" 2>/dev/null || stat -f %m "$zshrc_file" 2>/dev/null)
+
+    # 如果变量不存在，初始化它
+    if [[ -z "$ZSHRC_LAST_MODIFIED_TIME" ]]; then
+        export ZSHRC_LAST_MODIFIED_TIME=$zshrc_last_modified_time
+    fi
+
+    # 检查配置文件是否被修改
+    if [[ "$zshrc_last_modified_time" -gt "$ZSHRC_LAST_MODIFIED_TIME" ]]; then
+        # 重新加载配置文件
+        source ~/.zshrc
+        export ZSHRC_LAST_MODIFIED_TIME=$zshrc_last_modified_time
+        echo "配置文件已重新加载。"
+    fi
+}
+
+# 添加到 precmd 钩子  # 关闭不用
+#precmd_functions+=(check_and_reload_zshrc)
+
+

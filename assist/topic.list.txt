@@ -1,0 +1,18 @@
+    topics_to_subscribe = [
+        ("/cam0/color/image_raw", Image),
+        ("/cam1/color/image_raw", Image),
+        ("/cam2/color/image_raw", Image),
+        ("/cam3/color/image_raw", Image),
+        ("/cam4/color/image_raw", Image),
+        ("/cam0/depth/image_raw", Image),
+        ("/cam1/depth/image_raw", Image),
+        ("/cam2/depth/image_raw", Image),
+        ("/cam3/depth/image_raw", Image),
+        ("/cam4/depth/image_raw", Image),
+    ]
+
+            # ("/cam0/depth/points", PointCloud2),
+            # ("/cam1/depth/points", PointCloud2),
+            # ("/cam2/depth/points", PointCloud2),
+            # ("/cam3/depth/points", PointCloud2),
+            # ("/cam4/depth/points", PointCloud2),

@@ -1,0 +1,210 @@
+# ~/.bash_aliases: executed by bash(1) when login shell exits.
+
+# add follow if fi in you .zshrc, then source .zshrc
+# if [ -f ~/.bash_aliases ]; then
+#     . ~/.bash_aliases
+# fi
+
+
+
+
+
+#######################################
+
+#export ORBBEC_SHELL_PATH=~/robot_kit/robot_sdk/tools/assist/shell_cli.py
+export ORBBEC_SHELL_PATH=~/tools/assist/shell_cli.py
+
+
+sc() {
+echo "=sh $@"
+python3 $ORBBEC_SHELL_PATH "sh $*"
+}
+sh() {
+echo "=sh $@"
+python3 $ORBBEC_SHELL_PATH "sh $*"
+}
+
+topic() {
+python3 $ORBBEC_SHELL_PATH "topic $*"
+}
+launch() {
+python3 $ORBBEC_SHELL_PATH "launch $*"
+}
+node() {
+python3 $ORBBEC_SHELL_PATH "node $*"
+}
+param() {
+python3 $ORBBEC_SHELL_PATH "param $*"
+}
+tool() {
+python3 $ORBBEC_SHELL_PATH "tool $*"
+}
+check() {
+python3 $ORBBEC_SHELL_PATH "check $*"
+}
+run() {
+python3 $ORBBEC_SHELL_PATH "run $*"
+}
+
+#######################################
+alias ro='ros2'
+alias ros='ros2'
+alias to='topic'  #topic
+alias se='service'  #service
+alias no='node'
+alias ru='run'
+alias la='launch'
+alias pa='param'
+alias autobuild='./autobuild.sh'
+alias cb='colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release --symlink-install  --packages-up-to '
+alias shel='_goto(){ ros2 topic pub --once /shell std_msgs/msg/String "{data: $*}";};_goto'
+alias shell='_goto(){ ros2 topic pub --once /shell std_msgs/msg/String "{data: $*}";};_goto'
+#######################################
+alias hiall='history'	# 查看历史信息
+alias cl='clear && echo "clear ------------------------------------------ " ' # 清屏
+
+alias py='python3'
+alias ro='ros2'
+
+alias grepp='grep $1 -rn --exclude-dir={build,install,log,.git} --exclude=*.{so,lib}'
+alias gre='grep $1 -rn --exclude-dir={build,install,log,.git}'
+
+alias findd='find . -name $1'
+alias fin='find . -name $1'
+
+test1() {
+    echo "{test1: $*}"
+    echo "{test1: $@}"
+    echo "{test1: $0}"
+    echo "{test1: $1}"
+    echo "{test1: $2}"
+    echo "{test1: $#2}"
+}
+######################
+
+history_20() {
+    local history_output=$(history | tail -n 200)
+    #echo "$history_output"
+    #local no_number_history_output=$(echo "$history_output" | awk '{print substr($0, index($0, $2))}')
+	local no_number_history_output=$(echo "$history_output" | awk '{print substr($0, index($0, $2))}' | tac)
+    local unique_history_output=$(echo "$no_number_history_output" | awk '!seen[$0]++')
+    #echo "$unique_history_output"
+	#local final_history_output=$(echo "$unique_history_output" | tac | awk '{print NR "  " $0}' | head -n 30)
+	local final_history_output=$(echo "$unique_history_output" | awk '{print NR "  " $0}' | head -n 30)
+    echo "$final_history_output"
+    echo
+    echo "$final_history_output" > ~/_data/auto_history_cmd.txt
+    #echo "save ~/_data/auto_history_cmd.txt"
+}
+
+#auto history
+auto_history() {
+	if [ $# -eq 0 ]; then
+		history_20
+	elif [ $# -eq 1 ]; then  
+		local input=$1
+		
+		if [[ $input =~ '^[1-9][0-9]?$' ]]; then
+			    local command_file=~/_data/auto_history_cmd.txt
+				local line_number=$input
+				if [[ ! -f "$command_file" ]]; then
+					echo "文件 $command_file 不存在。"
+				fi
+
+				local command=$(sed -n "${line_number}p" "$command_file")
+				if [[ -z "$command" ]]; then
+					echo "无法读取文件的第 $line_number 行。"
+				fi
+				command=$(echo "$command" | sed 's/^[0-9]*  *//')
+				command=$(echo "$command" | sed 's/\x1b\[[0-9;]*m//g')
+				#echo "$command"
+				# 将命令刷新到当前终端的输入状态
+				# echo -n "$command"
+				# read -rs  # 缓存不立即执行
+
+				echo "$command"  
+				echo
+				print -s "$command"
+				eval "$command"
+
+		else
+			# 使用history命令搜索匹配的指令
+			local search_pattern="${input//\*/.*}"
+			local keyword=$(echo "$input" | tr -d '*')
+
+			# 从末尾逆序开始搜索历史文件
+			local history_output=$(history | tail -n 3000 | grep -i -- "$search_pattern" | head -n 3000 | tac | sed -E "s/($keyword)/\x1b\[32m\1\x1b\[0m/gi")
+			#echo "$history_output" | head -n 10
+
+			#local no_number_history_output=$(echo "$history_output" | awk '{print substr($0, index($0, $2))}' | tac)		
+			local no_number_history_output=$(echo "$history_output" | awk '{print substr($0, index($0, $2))}')
+			local unique_history_output=$(echo "$no_number_history_output" | awk '!seen[$0]++')
+			#echo "$unique_history_output"
+
+			local final_history_output=$(echo "$unique_history_output" | awk '{print NR "  " $0}' | head -n 20)
+			#echo "$final_history_output"
+			echo "$final_history_output" > ~/_data/auto_history_cmd.txt		
+			######
+			local history_output=$(history | tail -n 80)
+			#echo "$history_output"
+			local no_number_history_output=$(echo "$history_output" | awk '{print substr($0, index($0, $2))}' | tac)
+			local unique_history_output=$(echo "$no_number_history_output" | awk '!seen[$0]++')
+			#echo "$unique_history_output"
+			local line_count=$(echo "$final_history_output" | wc -l)
+			#echo "Number of unique history entries: $line_count"
+			local final_history_output=$(echo "$unique_history_output" | awk -v start="$line_count" '{print (NR + start) "  " $0}' | head -n 10)
+			echo "---------------"
+			echo "$final_history_output" >> ~/_data/auto_history_cmd.txt
+			#echo "$final_history_output"	
+			cat ~/_data/auto_history_cmd.txt
+		fi
+	else
+		history_20
+	fi
+
+}
+alias shl='auto_history'
+alias shh='auto_history'
+#######################################
+
+#export RCUTILS_CONSOLE_OUTPUT_FORMAT='[{severity}]{message}'    #不带时间戳
+export RCUTILS_CONSOLE_OUTPUT_FORMAT='[{severity}][{time}]{message}'
+
+
+# 程序公共  设置GAZEBO 默认仿真模型
+#export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:/opt/ros/humble/share/turtlebot3_gazebo/models
+#export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:~/tb3_ws/src/turtlebot3/turtlebot3_simulations/turtlebot3_gazebo/models' >> ~/.bashrc
+#export TURTLEBOT3_MODEL=burger #waffle
+#export amr_MODEL=burger
+
+#export ROS_DOMAIN_ID=55  # 两个设备互相发现 需要ROS_DOMAIN_ID 和 RMW_IMPLEMENTATION 一致
+#export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+#export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+#######################################
+#kill 功能
+ki() {
+	# 检查是否提供了关键字参数
+	if [ $# -eq 0 ]; then
+		echo "Usage: $0 <process_keyword>"
+		exit 1
+	fi
+
+	# 将关键字参数赋值给变量
+	keyword=$1
+
+	# 查找所有包含关键字的进程
+	processes=$(ps -ef | grep "$keyword" | grep -v grep | awk '{print $2}')
+
+	# 遍历进程号并杀掉它们
+	for pid in $processes; do
+		echo "Killing process with PID: $pid"
+		kill -9 "$pid"
+	done
+
+	echo "All processes containing '$keyword' have been terminated." 
+}
+
+
+
+
