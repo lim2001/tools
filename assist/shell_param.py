@@ -27,12 +27,14 @@ def config_file_exists():
 
 
 def read_config():
-    if config_file_exists():
-        with open(config_file_path, 'r') as file:
-            return json.load(file)
-    else:
-        print("config.json not found")
-        return None
+    if not config_file_exists():
+        print("config.json not found, creating a new one...")
+        with open(config_file_path, 'w') as file:
+            json.dump({}, file, indent=4)
+
+    with open(config_file_path, 'r') as file:
+        return json.load(file)
+
 
 
 def check_parameter_exists(parameter):
