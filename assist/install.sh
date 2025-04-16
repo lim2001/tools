@@ -1,27 +1,68 @@
-#!/bin/sh
+#!/bin/bash
 
-# 获取当前目录的所有文件并拷贝到用户目录的 .shell_cli 文件夹中
-current_dir=$(pwd)
-target_dir="$HOME/.shell_cli"
+SOURCE_FILE=".bash_aliases_install"
+TARGET_FILE="$HOME/.bash_aliases"
+BEGIN_MARK="# >>> BEGIN orbbec shell tool install aliases >>>"
+END_MARK="# <<< END orbbec shell tool install aliases <<<"
 
-# 创建目标目录（如果不存在）
-mkdir -p "$target_dir"
+# Ensure .bash_aliases exists
+[ ! -f "$TARGET_FILE" ] && touch "$TARGET_FILE"
 
-# 拷贝当前目录的所有文件到目标目录
-cp -v "$current_dir"/* "$target_dir"
+# Read source content without interpreting special characters
+NEW_BLOCK=$(cat "$SOURCE_FILE")
 
-# 向 .zshrc 文件中添加环境变量
-zshrc_path="$HOME/.zshrc"
-env_var="export ORBBEC_SHELL_PATH=~/.shell_cli/shell_cli.py"
+# Extract existing block (including markers)
+EXISTING_BLOCK=$(awk "/${BEGIN_MARK}/,/${END_MARK}/" "$TARGET_FILE")
+EXISTING_BODY=$(echo "$EXISTING_BLOCK" | sed "1d;\$d")
 
-# 检查是否已存在相同的环境变量设置
-if ! grep -qF -- "$env_var" "$zshrc_path"; then
-    # 如果不存在，则添加环境变量
-    echo "$env_var" >> "$zshrc_path"
-    echo "Environment variable added to .zshrc"
+# Determine whether to add or replace
+if [ -z "$EXISTING_BLOCK" ]; then
+    echo "[*] Alias block not found. Appending to the end of .bash_aliases..."
+    {
+        echo ""
+        echo "$BEGIN_MARK"
+        cat "$SOURCE_FILE"
+        echo "$END_MARK"
+    } >> "$TARGET_FILE"
+    echo "[✔] Block added successfully."
+elif [ "$EXISTING_BODY" != "$NEW_BLOCK" ]; then
+    echo "[*] Alias block content changed. Replacing existing block..."
+    cp "$TARGET_FILE" "$TARGET_FILE.bak"
+    sed -i "/${BEGIN_MARK}/,/${END_MARK}/d" "$TARGET_FILE"
+    {
+        echo ""
+        echo "$BEGIN_MARK"
+        cat "$SOURCE_FILE"
+        echo "$END_MARK"
+    } >> "$TARGET_FILE"
+    echo "[✔] Replacement complete. Backup saved as .bash_aliases.bak."
 else
-    echo "Environment variable already exists in .zshrc"
+    echo "[✓] Alias block is already up to date. No changes made."
 fi
 
-# 提示用户重新加载 .zshrc 或重启终端
-echo "Please reload your .zshrc file or restart your terminal to apply the changes."
+############################################
+
+# Define target tools path in user home
+TARGET_DIR="$HOME/tools"
+
+# Determine source tools path (from parent directory of this script)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_DIR="$(realpath "$SCRIPT_DIR/../tools")"
+
+# Step 1: Check for existing ~/tools directory
+if [ ! -d "$TARGET_DIR" ]; then
+    echo "[+] ~/tools does not exist. Creating it..."
+    mkdir -p "$TARGET_DIR"
+else
+    if [ ! -f "$TARGET_DIR/list_menu.py" ]; then
+        echo "[✘] ~/tools already exists, but list_menu.py is missing."
+        echo "    Possible conflict with an existing folder. Aborting."
+        exit 1
+    fi
+fi
+
+# Step 2: Copy files from source to target (overwriting if necessary)
+echo "[→] Copying files from $SOURCE_DIR to ~/tools ..."
+cp -rf "$SOURCE_DIR/"* "$TARGET_DIR/"
+
+echo "[✔] Copy complete. ~/tools is up to date."

@@ -1,23 +1,27 @@
-# ~/.bash_aliases: executed by bash(1) when login shell exits.
-
-# add follow if fi in you .zshrc, then source .zshrc
-# if [ -f ~/.bash_aliases ]; then
-#     . ~/.bash_aliases
-# fi
-
-
-
-
 
 #######################################
-
-#export ORBBEC_SHELL_PATH=~/robot_kit/robot_sdk/tools/assist/shell_cli.py
 export ORBBEC_SHELL_PATH=~/tools/assist/shell_cli.py
+export SET_MY_DEFAULT_ROS_WS_PATH=ros2_ws
 
+sour() {
+current_dir=$(pwd)
 
-sc() {
-echo "=sh $@"
-python3 $ORBBEC_SHELL_PATH "sh $*"
+if [[ "$current_dir" == */${SET_DEFAULT_ROS_WS_PATH} ]]; then
+    # echo "source"
+    source install/setup.bash
+else
+    if [ -d "${SET_MY_DEFAULT_ROS_WS_PATH}" ]; then
+	cd ${SET_MY_DEFAULT_ROS_WS_PATH}
+	#echo "switch to ${SET_MY_DEFAULT_ROS_WS_PATH} and source。"
+	source install/setup.bash
+    else
+	echo "not found folder ${SET_MY_DEFAULT_ROS_WS_PATH}/install"
+    fi
+fi
+}
+
+so() {
+source install/setup.bash
 }
 sh() {
 echo "=sh $@"
@@ -27,6 +31,7 @@ python3 $ORBBEC_SHELL_PATH "sh $*"
 topic() {
 python3 $ORBBEC_SHELL_PATH "topic $*"
 }
+
 launch() {
 python3 $ORBBEC_SHELL_PATH "launch $*"
 }
@@ -56,9 +61,10 @@ alias ru='run'
 alias la='launch'
 alias pa='param'
 alias autobuild='./autobuild.sh'
+alias b='./autobuild.sh'
 alias cb='colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release --symlink-install  --packages-up-to '
-alias shel='_goto(){ ros2 topic pub --once /shell std_msgs/msg/String "{data: $*}";};_goto'
-alias shell='_goto(){ ros2 topic pub --once /shell std_msgs/msg/String "{data: $*}";};_goto'
+#alias shel='_goto(){ ros2 topic pub --once /shell std_msgs/msg/String "{data: $*}";};_goto'
+#alias shell='_goto(){ ros2 topic pub --once /shell std_msgs/msg/String "{data: $*}";};_goto'
 #######################################
 alias hiall='history'	# 查看历史信息
 alias cl='clear && echo "clear ------------------------------------------ " ' # 清屏
@@ -101,9 +107,9 @@ history_20() {
 auto_history() {
 	if [ $# -eq 0 ]; then
 		history_20
-	elif [ $# -eq 1 ]; then  
+	elif [ $# -eq 1 ]; then
 		local input=$1
-		
+
 		if [[ $input =~ '^[1-9][0-9]?$' ]]; then
 			    local command_file=~/_data/auto_history_cmd.txt
 				local line_number=$input
@@ -122,7 +128,7 @@ auto_history() {
 				# echo -n "$command"
 				# read -rs  # 缓存不立即执行
 
-				echo "$command"  
+				echo "$command"
 				echo
 				print -s "$command"
 				eval "$command"
@@ -136,14 +142,14 @@ auto_history() {
 			local history_output=$(history | tail -n 3000 | grep -i -- "$search_pattern" | head -n 3000 | tac | sed -E "s/($keyword)/\x1b\[32m\1\x1b\[0m/gi")
 			#echo "$history_output" | head -n 10
 
-			#local no_number_history_output=$(echo "$history_output" | awk '{print substr($0, index($0, $2))}' | tac)		
+			#local no_number_history_output=$(echo "$history_output" | awk '{print substr($0, index($0, $2))}' | tac)
 			local no_number_history_output=$(echo "$history_output" | awk '{print substr($0, index($0, $2))}')
 			local unique_history_output=$(echo "$no_number_history_output" | awk '!seen[$0]++')
 			#echo "$unique_history_output"
 
 			local final_history_output=$(echo "$unique_history_output" | awk '{print NR "  " $0}' | head -n 20)
 			#echo "$final_history_output"
-			echo "$final_history_output" > ~/_data/auto_history_cmd.txt		
+			echo "$final_history_output" > ~/_data/auto_history_cmd.txt
 			######
 			local history_output=$(history | tail -n 80)
 			#echo "$history_output"
@@ -155,7 +161,7 @@ auto_history() {
 			local final_history_output=$(echo "$unique_history_output" | awk -v start="$line_count" '{print (NR + start) "  " $0}' | head -n 10)
 			echo "---------------"
 			echo "$final_history_output" >> ~/_data/auto_history_cmd.txt
-			#echo "$final_history_output"	
+			#echo "$final_history_output"
 			cat ~/_data/auto_history_cmd.txt
 		fi
 	else
@@ -166,45 +172,6 @@ auto_history() {
 alias shl='auto_history'
 alias shh='auto_history'
 #######################################
-
-#export RCUTILS_CONSOLE_OUTPUT_FORMAT='[{severity}]{message}'    #不带时间戳
-export RCUTILS_CONSOLE_OUTPUT_FORMAT='[{severity}][{time}]{message}'
-
-
-# 程序公共  设置GAZEBO 默认仿真模型
-#export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:/opt/ros/humble/share/turtlebot3_gazebo/models
-#export GAZEBO_MODEL_PATH=$GAZEBO_MODEL_PATH:~/tb3_ws/src/turtlebot3/turtlebot3_simulations/turtlebot3_gazebo/models' >> ~/.bashrc
-#export TURTLEBOT3_MODEL=burger #waffle
-#export amr_MODEL=burger
-
-#export ROS_DOMAIN_ID=55  # 两个设备互相发现 需要ROS_DOMAIN_ID 和 RMW_IMPLEMENTATION 一致
-#export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-#export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-
-#######################################
-#kill 功能
-ki() {
-	# 检查是否提供了关键字参数
-	if [ $# -eq 0 ]; then
-		echo "Usage: $0 <process_keyword>"
-		exit 1
-	fi
-
-	# 将关键字参数赋值给变量
-	keyword=$1
-
-	# 查找所有包含关键字的进程
-	processes=$(ps -ef | grep "$keyword" | grep -v grep | awk '{print $2}')
-
-	# 遍历进程号并杀掉它们
-	for pid in $processes; do
-		echo "Killing process with PID: $pid"
-		kill -9 "$pid"
-	done
-
-	echo "All processes containing '$keyword' have been terminated." 
-}
-
 
 
 
