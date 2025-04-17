@@ -28,7 +28,6 @@ def config_file_exists():
 
 def read_config():
     if not config_file_exists():
-        print("config.json not found, creating a new one...")
         with open(config_file_path, 'w') as file:
             json.dump({}, file, indent=4)
 

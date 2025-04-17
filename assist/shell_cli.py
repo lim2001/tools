@@ -64,7 +64,7 @@ def print_debug(*args, **kwargs):
     timestamp = datetime.datetime.now().strftime("[%m %H:%M:%S.%f")[:-3]+ "]"
     print(timestamp, *args, **kwargs)
 
-def sh_help_menu():
+def shell_help_menu():
 
     print("**************************************************")
     print("*       ORBBEC AI & ROBOTICS TECHNOLOGIES       *")
@@ -564,8 +564,8 @@ def handle_shh(shell_data=None):
         # Search and display history matching input
         return search_history(shell_data.srcStrArg)
 
-def handle_sh(shell_data):
-    sh_help_menu()
+def handle_shell(shell_data):
+    shell_help_menu()
     return 1  # Return 1 to indicate command is processed
 
 def handle_she(shell_data):
@@ -602,6 +602,7 @@ def handle_tool(shell_data):
         exec_cmd(command)
 
     return 1
+
 def handle_config(shell_data):
     if shell_data.argc == 1:
         debug_enable = get_parameter('PRINT_DEBUG_ENABLE')
@@ -692,12 +693,13 @@ def handle_check(shell_data):
 def handle(shell_data):
     print(f"handle {shell_data.srcStrBuf}")
     return 1
+
 def print_shell_data(shell_data):
     print("---------------------------")
     print(f"srcStrBuf: {shell_data.srcStrBuf}")
     print(f"srcStrArg: {shell_data.srcStrArg}")
     print(f"argc: {shell_data.argc}")
-    print(f"argv: {shell_data.argv[0]}")
+    print(f"argv[0]: {shell_data.argv[0]}")
     return 1
 
 def read_config_debug_param():
@@ -743,9 +745,9 @@ def main(cmd):
         case 'param':
             read_config_debug_param()
             handle_param(shell_data)
-        case 'sh':
+        case 'shell' | 'sh':
             read_config_debug_param()
-            handle_sh(shell_data)
+            handle_shell(shell_data)
         case 'she':
             read_config_debug_param()
             handle_she(shell_data)

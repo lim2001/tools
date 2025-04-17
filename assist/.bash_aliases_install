@@ -21,39 +21,48 @@ fi
 }
 
 so() {
-source install/setup.bash
+    source install/setup.bash
 }
-sh() {
-echo "=sh $@"
-python3 $ORBBEC_SHELL_PATH "sh $*"
+
+shell() {
+    echo "=shell $@"
+    python3 $ORBBEC_SHELL_PATH "shell $*"
 }
 
 topic() {
-python3 $ORBBEC_SHELL_PATH "topic $*"
+    python3 $ORBBEC_SHELL_PATH "topic $*"
 }
 
 launch() {
-python3 $ORBBEC_SHELL_PATH "launch $*"
+    python3 $ORBBEC_SHELL_PATH "launch $*"
 }
 node() {
-python3 $ORBBEC_SHELL_PATH "node $*"
+    python3 $ORBBEC_SHELL_PATH "node $*"
 }
 param() {
-python3 $ORBBEC_SHELL_PATH "param $*"
+    python3 $ORBBEC_SHELL_PATH "param $*"
 }
 tool() {
-python3 $ORBBEC_SHELL_PATH "tool $*"
+    python3 $ORBBEC_SHELL_PATH "tool $*"
 }
 check() {
-python3 $ORBBEC_SHELL_PATH "check $*"
+    python3 $ORBBEC_SHELL_PATH "check $*"
 }
 run() {
-python3 $ORBBEC_SHELL_PATH "run $*"
+    python3 $ORBBEC_SHELL_PATH "run $*"
 }
 
 #######################################
+alias py='python3'
 alias ro='ros2'
-alias ros='ros2'
+alias sh='shell'
+alias cl='clear && echo "clear ------------------------------------------ " ' # 清屏
+
+alias grepp='grep $1 -rn --exclude-dir={build,install,log,.git} --exclude=*.{so,lib}'
+alias gre='grep $1 -rn --exclude-dir={build,install,log,.git}'
+alias findd='find . -name $1'
+alias fin='find . -name $1'
+
 alias to='topic'  #topic
 alias se='service'  #service
 alias no='node'
@@ -65,18 +74,7 @@ alias b='./autobuild.sh'
 alias cb='colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release --symlink-install  --packages-up-to '
 #alias shel='_goto(){ ros2 topic pub --once /shell std_msgs/msg/String "{data: $*}";};_goto'
 #alias shell='_goto(){ ros2 topic pub --once /shell std_msgs/msg/String "{data: $*}";};_goto'
-#######################################
-alias hiall='history'	# 查看历史信息
-alias cl='clear && echo "clear ------------------------------------------ " ' # 清屏
 
-alias py='python3'
-alias ro='ros2'
-
-alias grepp='grep $1 -rn --exclude-dir={build,install,log,.git} --exclude=*.{so,lib}'
-alias gre='grep $1 -rn --exclude-dir={build,install,log,.git}'
-
-alias findd='find . -name $1'
-alias fin='find . -name $1'
 
 test1() {
     echo "{test1: $*}"
