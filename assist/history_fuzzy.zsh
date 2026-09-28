@@ -366,6 +366,15 @@ if [[ -o interactive ]] && zle -l >/dev/null 2>&1; then
   zmodload zsh/complist 2>/dev/null
   autoload -Uz _generic 2>/dev/null
 
+  # ---- 与 zsh-autosuggestions 共存 -------------------------------------------
+  # 它默认异步（zpty 回调）直接改写 POSTDISPLAY 来显示行内灰字建议，那段回调
+  # 不在按键路径上、会在我们渲染之后把列表刷掉。关掉它的异步后，它改 POSTDISPLAY
+  # 的时机回到 widget 阶段（早于 pre-redraw），我们的列表就不会被覆盖。
+  # 代价：行内灰字建议让位给列表（两者功能重复，列表已经包含了它）。
+  # 想保留异步（列表可能偶尔被闪掉）就设 HIST_FUZZY_ALLOW_ASYNC=1。
+  (( ${+functions[_zsh_autosuggest_fetch]} )) && [[ -z $HIST_FUZZY_ALLOW_ASYNC ]] && \
+    unset ZSH_AUTOSUGGEST_USE_ASYNC
+
   zle -C hist-fuzzy-menu menu-select _generic
   zstyle ':completion:hist-fuzzy-menu:*' completer _hist_fuzzy_complete
   zstyle ':completion:hist-fuzzy-menu:*' matcher-list ''
@@ -386,6 +395,35 @@ if [[ -o interactive ]] && zle -l >/dev/null 2>&1; then
   }
   (( ${precmd_functions[(I)_hist_fuzzy_precmd]} )) || precmd_functions+=(_hist_fuzzy_precmd)
 
+  # 现场取证：输入若干字符后按 Esc+D（Alt+D），把 zle 的真实状态写到文件，便于排查
+  function _hist_fuzzy_dump {
+    _hist_fuzzy_trigger
+    local f=${HIST_FUZZY_DUMP_FILE:-/tmp/histf_dump.txt}
+    {
+      print "===== $(date '+%F %T') ====="
+      print "版本        : $_HIST_FUZZY_VERSION"
+      print "BUFFER      : [$BUFFER]  CURSOR=$CURSOR"
+      print "LINES/COLS  : $LINES / $COLUMNS"
+      print "渲染位置    : ${HIST_FUZZY_PLACE}"
+      print "PREDISPLAY  : ${#PREDISPLAY} 字节"
+      print "POSTDISPLAY : ${#POSTDISPLAY} 字节"
+      print "POSTDISPLAY 内容: ${POSTDISPLAY}"
+      print "region_hl   : $region_highlight"
+      print "cache       : ${#_hist_fuzzy_cache} 条"
+      print "result      : ${#_hist_fuzzy_result} 条  n_loose=$_hist_fuzzy_n_loose"
+      print "pre-redraw  : ${widgets[zle-line-pre-redraw]}"
+      print "self-insert : ${widgets[self-insert]}"
+      print "autosuggest : $(( ${+functions[_zsh_autosuggest_fetch]} ? 1 : 0 ))  异步=$(( ${+ZSH_AUTOSUGGEST_USE_ASYNC} ? 1 : 0 ))"
+      print "---- 匹配结果 ----"
+      print -l $_hist_fuzzy_result
+    } > $f 2>&1
+    zle -M "已写入 $f"
+  }
+  zle -N hist-fuzzy-dump _hist_fuzzy_dump
+  bindkey -M emacs '\ed' hist-fuzzy-dump 2>/dev/null
+  bindkey -M viins '\ed' hist-fuzzy-dump 2>/dev/null
+  bindkey -M vicmd '\ed' hist-fuzzy-dump 2>/dev/null
+
   _hist_fuzzy_hook_install
 fi
 
@@ -399,6 +437,12 @@ histf-diag() {
   print "终端尺寸  : LINES=${LINES:-未设置} COLUMNS=${COLUMNS:-未设置}"
   print "pre-redraw: ${widgets[zle-line-pre-redraw]:-未注册}"
   print "编辑部件  : self-insert=${widgets[self-insert]:-无} / accept-line=${widgets[accept-line]:-无}"
+  if (( ${+functions[_zsh_autosuggest_fetch]} )); then
+    print "autosuggest: 已启用，异步=$(( ${+ZSH_AUTOSUGGEST_USE_ASYNC} ? 1 : 0 ))（异步=1 会抢 POSTDISPLAY）"
+  else
+    print "autosuggest: 未启用"
+  fi
+  print "POSTDISPLAY: ${#POSTDISPLAY} 字节"
   local q=${1:-build} saved=$LBUFFER
   LBUFFER=$q
   if _hist_fuzzy_build; then
