@@ -34,7 +34,10 @@ typeset -g _HIST_FUZZY_LOADED=1
 : ${HIST_FUZZY_MIN_LEN:=1}
 : ${HIST_FUZZY_COLOR_TOP:=fg=green,bold}
 : ${HIST_FUZZY_COLOR_REST:=fg=blue}
+: ${HIST_FUZZY_COLOR_FUZZY:=fg=black,bold}        # 非连续凑数项：更暗，一眼能区分
 : ${HIST_FUZZY_PLACE:=above}                      # above=列表在输入行上方(默认) / below=下方
+: ${HIST_FUZZY_FUZZY_MAX:=4}                      # 非连续(凑数)匹配最多补几条；设 0 = 完全不要
+: ${HIST_FUZZY_FUZZY_MIN_LEN:=2}                  # 少于几个字符不做非连续匹配
 typeset -ga HIST_FUZZY_IGNORE
 (( ${#HIST_FUZZY_IGNORE} )) || HIST_FUZZY_IGNORE=(shl shh auto_history history_20)
 
@@ -43,6 +46,7 @@ typeset -ga _hist_fuzzy_cache          # 历史缓存：最新在前，已去重
 typeset -ga _hist_fuzzy_result         # 当前匹配结果
 typeset -ga _hist_fuzzy_hl             # 本次添加的 region_highlight
 typeset -g  _hist_fuzzy_last_histcmd=0
+typeset -g  _hist_fuzzy_n_exact=0                # 前三级(真匹配)条数，其余为凑数项
 
 # ---------- 1. 历史缓存 ----------
 _hist_fuzzy_refresh() {
@@ -105,8 +109,10 @@ _hist_fuzzy_build() {
   uall=($m1 $m2 $m3)
   all=($uall)
 
-  # 前三级不足 MAX_SHOW 条时才跑非连续匹配（最贵的一步）
-  if (( ${#all} < HIST_FUZZY_MAX_SHOW )); then
+  _hist_fuzzy_n_exact=${#all}                          # 前三级条数（渲染时用来区分凑数项）
+
+  # 前三级不足 MAX_SHOW 条时才跑非连续匹配（最容易产生噪音的一步）
+  if (( ${#all} < HIST_FUZZY_MAX_SHOW && ${#q} >= HIST_FUZZY_FUZZY_MIN_LEN )); then
     local -a cs ec=()
     cs=(${(s::)q})
     local c
@@ -114,11 +120,25 @@ _hist_fuzzy_build() {
     # 注意：不能写成 ${~"*${(j:*:)ec}*"}，交互式 zsh 下嵌套带引号展开会 bad substitution
     local fpat="*${(j:*:)ec}*"
     m4=(${(M)_hist_fuzzy_cache:#${~fpat}})             # 非连续：buil -> *b*u*i*l*d*
-    # 组内：命令越短 = 匹配越紧凑，优先
+
+    # 评分排序：① 匹配跨度越小越紧凑 ② 首个匹配字符越靠前越好 ③ 命令越短越好
+    # 这样 "dmesg" 不会被 "sudo apt-get install ..." 之类的松散命中挤掉
     local -a tmp=()
-    local k
-    for k in $m4; do tmp+=("${(l:6::0:)${#k}} $k"); done
+    local k f l span
+    for k in $m4; do
+      f=${k[(i)${ec[1]}]}                              # 最左：首个查询字符的位置
+      l=${k[(I)${ec[-1]}]}                             # 最右：末个查询字符的位置
+      if (( l < f )); then span=999; else span=$(( l - f + 1 )); fi
+      (( f > ${#k} )) && f=999
+      tmp+=("${(l:3::0:)span}${(l:3::0:)f}${(l:4::0:)${#k}} $k")
+    done
     m4=(${${(o)tmp}#* })
+
+    # 凑数项最多补 HIST_FUZZY_FUZZY_MAX 条，避免一屏噪音
+    local room=$(( HIST_FUZZY_MAX_SHOW - ${#all} ))
+    (( room > HIST_FUZZY_FUZZY_MAX )) && room=$HIST_FUZZY_FUZZY_MAX
+    m4=(${m4[1,room]})
+
     local -aU uall2
     uall2=($all $m4)
     all=($uall2)
@@ -166,7 +186,9 @@ _hist_fuzzy_render() {
       (( ${#line} > maxw )) && line="${line[1,maxw]}"
       txt+=$line$'\n'
       i=$(( i + 1 ))
-      if (( i == 1 )); then col=$HIST_FUZZY_COLOR_TOP; else col=$HIST_FUZZY_COLOR_REST; fi
+      if (( i == 1 )); then col=$HIST_FUZZY_COLOR_TOP
+      elif (( i <= _hist_fuzzy_n_exact )); then col=$HIST_FUZZY_COLOR_REST
+      else col=$HIST_FUZZY_COLOR_FUZZY; fi
       hl+=("$(( off + 1 )) $(( off + 1 + ${#line} )) $col")
       off=$(( off + 1 + ${#line} ))
     done
@@ -178,7 +200,9 @@ _hist_fuzzy_render() {
       (( ${#line} > maxw )) && line="${line[1,maxw]}"
       txt+=$line$'\n'
       i=$(( i + 1 ))
-      if (( i == 1 )); then col=$HIST_FUZZY_COLOR_TOP; else col=$HIST_FUZZY_COLOR_REST; fi
+      if (( i == 1 )); then col=$HIST_FUZZY_COLOR_TOP
+      elif (( i <= _hist_fuzzy_n_exact )); then col=$HIST_FUZZY_COLOR_REST
+      else col=$HIST_FUZZY_COLOR_FUZZY; fi
       hl+=("$off $(( off + ${#line} )) $col")
       off=$(( off + ${#line} + 1 ))
     done
