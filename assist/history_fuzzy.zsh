@@ -331,16 +331,19 @@ _hist_fuzzy_render() {
 #  模块 F：触发 + 部件
 # ============================================================
 _hist_fuzzy_trigger() {
-  # 同一次按键里被多个入口调用时只算一次
-  local key="$BUFFER|$CURSOR|$_hist_fuzzy_last_histcmd"
+  # 同一次按键里被多个入口调用时只算一次；
+  # 但 key 里带上列表长度：一旦别的插件偷偷清掉 POSTDISPLAY(zsh-autosuggestions
+  # 就会这么干)，key 就变了，下一次重绘会把列表补回来，做到自愈。
+  local key="$BUFFER|$CURSOR|$_hist_fuzzy_last_histcmd|${#POSTDISPLAY}|${#PREDISPLAY}"
   [[ $key == $_hist_fuzzy_prev_key ]] && return 0
-  _hist_fuzzy_prev_key=$key
   _hist_fuzzy_clear
   if [[ -n $LBUFFER \
      && $LBUFFER != *[[:space:]]* \
      && ${#LBUFFER} -ge $HIST_FUZZY_MIN_LEN ]]; then
     _hist_fuzzy_build && _hist_fuzzy_render
   fi
+  # 记录渲染「之后」的真实状态：列表一旦被别的插件清掉，下一次重绘就能自愈
+  _hist_fuzzy_prev_key="$BUFFER|$CURSOR|$_hist_fuzzy_last_histcmd|${#POSTDISPLAY}|${#PREDISPLAY}"
   return 0
 }
 
@@ -420,9 +423,10 @@ if [[ -o interactive ]] && zle -l >/dev/null 2>&1; then
     zle -M "已写入 $f"
   }
   zle -N hist-fuzzy-dump _hist_fuzzy_dump
-  bindkey -M emacs '\ed' hist-fuzzy-dump 2>/dev/null
-  bindkey -M viins '\ed' hist-fuzzy-dump 2>/dev/null
-  bindkey -M vicmd '\ed' hist-fuzzy-dump 2>/dev/null
+  # 注意：不能用 Esc 前缀（vi-mode 里 Esc 被占用）， ^Xd 在 emacs/vi 下都安全
+  bindkey -M emacs '^Xd' hist-fuzzy-dump 2>/dev/null
+  bindkey -M viins '^Xd' hist-fuzzy-dump 2>/dev/null
+  bindkey -M vicmd '^Xd' hist-fuzzy-dump 2>/dev/null
 
   _hist_fuzzy_hook_install
 fi
