@@ -35,9 +35,11 @@ typeset -g _HIST_FUZZY_LOADED=1
 : ${HIST_FUZZY_COLOR_TOP:=fg=green,bold}
 : ${HIST_FUZZY_COLOR_REST:=fg=blue}
 : ${HIST_FUZZY_COLOR_FUZZY:=fg=black,bold}        # 非连续凑数项：更暗，一眼能区分
-: ${HIST_FUZZY_PLACE:=above}                      # above=列表在输入行上方(默认) / below=下方
+: ${HIST_FUZZY_PLACE:=below}                      # below=列表在输入行下方(默认) / above=上方
 : ${HIST_FUZZY_FUZZY_MAX:=4}                      # 非连续(凑数)匹配最多补几条；设 0 = 完全不要
 : ${HIST_FUZZY_FUZZY_MIN_LEN:=2}                  # 少于几个字符不做非连续匹配
+: ${HIST_FUZZY_SPAN_SLACK:=3}                     # 非连续匹配的松散容忍度：跨度 <= 查询长度 + 该值
+                                                  #   调小(0/1)=只留非常紧凑的，调大(10+)=宽松
 typeset -ga HIST_FUZZY_IGNORE
 (( ${#HIST_FUZZY_IGNORE} )) || HIST_FUZZY_IGNORE=(shl shh auto_history history_20)
 
@@ -125,11 +127,14 @@ _hist_fuzzy_build() {
     # 这样 "dmesg" 不会被 "sudo apt-get install ..." 之类的松散命中挤掉
     local -a tmp=()
     local k f l span
+    local slack=$(( ${#q} + HIST_FUZZY_SPAN_SLACK ))
     for k in $m4; do
       f=${k[(i)${ec[1]}]}                              # 最左：首个查询字符的位置
       l=${k[(I)${ec[-1]}]}                             # 最右：末个查询字符的位置
       if (( l < f )); then span=999; else span=$(( l - f + 1 )); fi
       (( f > ${#k} )) && f=999
+      # 门槛：匹配字符铺得太开（跨度远大于查询长度）的直接丢掉
+      (( span > slack )) && continue
       tmp+=("${(l:3::0:)span}${(l:3::0:)f}${(l:4::0:)${#k}} $k")
     done
     m4=(${${(o)tmp}#* })
