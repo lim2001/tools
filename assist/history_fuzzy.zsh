@@ -3,7 +3,7 @@
 #  history_fuzzy.zsh  -  常驻式实时历史模糊下拉（zsh 原生）
 #
 #  行为：
-#    * 在提示符行首输入任意字符（无空格）即自动在下方列出匹配的历史命令
+#    * 在提示符行首输入任意字符（无空格）即自动列出匹配的历史命令
 #    * 每敲一个键实时重算重排，最多 HIST_FUZZY_MAX_SHOW(默认10) 条
 #    * 优先级：全词匹配 > 开头匹配 > 中间匹配 > 非连续(子序列)匹配
 #      前三级内按「最近使用」排序；非连续组内按命令长度（匹配越紧凑越靠前）
@@ -11,7 +11,9 @@
 #    * 需要选中：Ctrl-X h 打开 complist 菜单，方向键 + 回车 填入命令行
 #    * 历史只扫描最近 HIST_FUZZY_MAX_HIST(默认1000) 条，避免资源/卡顿
 #
-#  渲染方式：POSTDISPLAY（由 zle 负责重绘与清除，不抢终端、不破坏回滚）
+#  渲染方式：PREDISPLAY（默认，向上延伸，列表在输入行上方，输入行永不被顶走）
+#            或 POSTDISPLAY（向下，列表在输入行下方）
+#            两者都由 zle 负责重绘与清除，不抢终端、不破坏回滚缓冲
 #
 #  可调参数（在 source 之前设置）：
 #    HIST_FUZZY_MAX_HIST   扫描最近多少条历史（默认 1000）
@@ -32,6 +34,7 @@ typeset -g _HIST_FUZZY_LOADED=1
 : ${HIST_FUZZY_MIN_LEN:=1}
 : ${HIST_FUZZY_COLOR_TOP:=fg=green,bold}
 : ${HIST_FUZZY_COLOR_REST:=fg=blue}
+: ${HIST_FUZZY_PLACE:=above}                      # above=列表在输入行上方(默认) / below=下方
 typeset -ga HIST_FUZZY_IGNORE
 (( ${#HIST_FUZZY_IGNORE} )) || HIST_FUZZY_IGNORE=(shl shh auto_history history_20)
 
@@ -108,7 +111,9 @@ _hist_fuzzy_build() {
     cs=(${(s::)q})
     local c
     for c in $cs; do ec+=(${(b)c}); done
-    m4=(${(M)_hist_fuzzy_cache:#${~"*${(j:*:)ec}*"}}) # 非连续：buil -> *b*u*i*l*d*
+    # 注意：不能写成 ${~"*${(j:*:)ec}*"}，交互式 zsh 下嵌套带引号展开会 bad substitution
+    local fpat="*${(j:*:)ec}*"
+    m4=(${(M)_hist_fuzzy_cache:#${~fpat}})             # 非连续：buil -> *b*u*i*l*d*
     # 组内：命令越短 = 匹配越紧凑，优先
     local -a tmp=()
     local k
@@ -125,6 +130,7 @@ _hist_fuzzy_build() {
 
 # ---------- 3. 渲染 ----------
 _hist_fuzzy_clear() {
+  PREDISPLAY=''
   POSTDISPLAY=''
   if (( ${#_hist_fuzzy_hl} )); then
     local -a keep=()
@@ -142,24 +148,43 @@ _hist_fuzzy_render() {
   cands=($_hist_fuzzy_result)
   (( ${#cands} )) || return 1
 
+  # 屏幕高度不够时自动少显示几条（避免整屏被列表占满）
+  local maxn=$(( ${LINES:-24} - 3 ))
+  (( maxn < 1 )) && return 1
+  (( ${#cands} > maxn )) && cands=(${cands[1,maxn]})
+
   local maxw=$(( ${COLUMNS:-80} - 1 ))
-  local line off=${#BUFFER} i=0
-  local txt=$'\n'
+  local line off i=0 col
+  local txt=''
   local -a hl=()
 
-  for line in $cands; do
-    (( ${#line} > maxw )) && line="${line[1,maxw]}"
-    txt+=$line$'\n'
-    i=$(( i + 1 ))
-    if (( i == 1 )); then
-      hl+=("$(( off + 1 )) $(( off + 1 + ${#line} )) $HIST_FUZZY_COLOR_TOP")
-    else
-      hl+=("$(( off + 1 )) $(( off + 1 + ${#line} )) $HIST_FUZZY_COLOR_REST")
-    fi
-    off=$(( off + 1 + ${#line} ))
-  done
+  if [[ $HIST_FUZZY_PLACE == below ]]; then
+    # 向下：光标之后（列表在输入行下方）
+    txt=$'\n'
+    off=${#BUFFER}
+    for line in $cands; do
+      (( ${#line} > maxw )) && line="${line[1,maxw]}"
+      txt+=$line$'\n'
+      i=$(( i + 1 ))
+      if (( i == 1 )); then col=$HIST_FUZZY_COLOR_TOP; else col=$HIST_FUZZY_COLOR_REST; fi
+      hl+=("$(( off + 1 )) $(( off + 1 + ${#line} )) $col")
+      off=$(( off + 1 + ${#line} ))
+    done
+    POSTDISPLAY=$txt
+  else
+    # 向上：提示符之后、输入行之前（列表在输入行上方，输入行不会被顶走）
+    off=0
+    for line in $cands; do
+      (( ${#line} > maxw )) && line="${line[1,maxw]}"
+      txt+=$line$'\n'
+      i=$(( i + 1 ))
+      if (( i == 1 )); then col=$HIST_FUZZY_COLOR_TOP; else col=$HIST_FUZZY_COLOR_REST; fi
+      hl+=("$off $(( off + ${#line} )) $col")
+      off=$(( off + ${#line} + 1 ))
+    done
+    PREDISPLAY=$txt
+  fi
 
-  POSTDISPLAY=$txt
   region_highlight+=($hl)
   _hist_fuzzy_hl=($hl)
 }
@@ -178,6 +203,7 @@ _hist_fuzzy_trigger() {
 
 # ---------- 5. 补全函数（Ctrl-X h 菜单用） ----------
 _hist_fuzzy_complete() {
+  _hist_fuzzy_clear                       # 菜单弹出前先收起列表，避免画面重叠
   _hist_fuzzy_build || return 1
   (( ${#_hist_fuzzy_result} )) || return 1
   compadd -Q -o nosort -V history -a _hist_fuzzy_result
