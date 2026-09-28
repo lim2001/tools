@@ -171,5 +171,13 @@ alias shl='auto_history'
 alias shh='auto_history'
 #######################################
 
+#######################################
+# zsh 专用：常驻式实时历史模糊下拉（bash 下跳过）
+#   行首输入即自动列出匹配的历史命令，最多10条，扫描最近1000条历史
+if [ -n "$ZSH_VERSION" ] && [ -f ~/tools/assist/history_fuzzy.zsh ]; then
+    . ~/tools/assist/history_fuzzy.zsh
+fi
+#######################################
+
 
 
