@@ -133,16 +133,17 @@ _hist_fuzzy_refresh() {
   (( _hist_fuzzy_last_histcmd == ${HISTCMD:-0} && ${#_hist_fuzzy_cache} )) && return 0
   _hist_fuzzy_last_histcmd=${HISTCMD:-0}
 
-  local -a h
-  local first=1
+  # 注意：所有局部变量只在函数开头声明一次。
+  # zsh 里同一个变量名被 local 两次会把旧值打印到 stdout，循环体内尤其不能写 local。
+  local -a h h2 raw out=()
+  local -aU u
+  local first=1 x cmd0
   (( ${HISTCMD:-0} > HIST_FUZZY_MAX_HIST )) && first=$(( HISTCMD - HIST_FUZZY_MAX_HIST + 1 ))
   h=(${(f)"$(fc -l -n $first 2>/dev/null)"})
 
   # 兜底：内存历史不足 50 条时直接读文件（如 HISTSIZE 被设得很小 / 尚未加载）
   if (( ${#h} < 50 )) && [[ -n $HISTFILE && -f $HISTFILE ]]; then
-    local -a raw h2=()
     raw=(${(f)"$(tail -n ${HIST_FUZZY_MAX_HIST} $HISTFILE 2>/dev/null)"})
-    local x
     for x in $raw; do
       [[ $x =~ '^: [0-9]+:[0-9]+;' ]] && x=${x#*;}   # 去掉 extended history 前缀
       h2+=($x)
@@ -150,12 +151,9 @@ _hist_fuzzy_refresh() {
     h=($h2)
   fi
 
-  local -a h2
   h2=(${(Oa)h})                                      # 最新在前
 
   # 先规范化再最后去重：否则 "git commit" 和 "git commit " 会被当成两条
-  local -a out=()
-  local x cmd0
   for x in $h2; do
     x=${x%"${x##*[![:space:]]}"}                     # 去尾部空白
     x=${x//$'\t'/ }                                  # tab 统一成空格
@@ -170,7 +168,6 @@ _hist_fuzzy_refresh() {
     out+=($x)
   done
 
-  local -aU u
   u=($out)                                           # 去重，保留最新的那条
   _hist_fuzzy_cache=(${u[1,HIST_FUZZY_MAX_HIST]})
 }
@@ -202,6 +199,11 @@ typeset -g  _hist_fuzzy_dim_val=0               # 维度函数的输出
 # 注册一个维度：
 #   $1=维度名  $2=默认权重  $3=打分代码片段（推荐，编译后零函数调用开销）
 # 不传 $3 时退化为「调用 _hist_fuzzy_dim_<名> 函数」的写法（方便，但每候选多一次调用）
+#
+# ⚠ 片段里的局部变量请统一加「维度名_」前缀！
+#   所有维度的片段会被编译进同一个函数，而 zsh 对 functions[name]="..." 定义的
+#   函数里「同一个变量名被 local 两次」会把旧值打印到 stdout（这是血泪教训：
+#   屏幕上一堆 k=3 / sc=502823 就是这么来的）。用前缀隔开就不会撞名。
 _hist_fuzzy_dim_add() {
   local name=$1 w=$2 code=$3 var=HIST_FUZZY_W_${1:u}
   (( ${_hist_fuzzy_dims[(I)$name]} )) || _hist_fuzzy_dims+=($name)
@@ -238,41 +240,41 @@ $body  _hist_fuzzy_sc=\$sc
 
 # 相邻命中：连续段越长说明查询串越完整
 _hist_fuzzy_dim_add consec 2000 '
-  local k v=0
-  for (( k = 2; k <= ${#_hist_fuzzy_hits}; k++ )); do
-    (( _hist_fuzzy_hits[k] == _hist_fuzzy_hits[k-1] + 1 )) && (( v += 1 ))
+  local consec_k consec_v=0
+  for (( consec_k = 2; consec_k <= ${#_hist_fuzzy_hits}; consec_k++ )); do
+    (( _hist_fuzzy_hits[consec_k] == _hist_fuzzy_hits[consec_k-1] + 1 )) && (( consec_v += 1 ))
   done
-  _hist_fuzzy_dim_val=$v'
+  _hist_fuzzy_dim_val=$consec_v'
 
 # 命中字符落在单词边界（分隔符之后）或行首：语义相关性更强
 _hist_fuzzy_dim_add bound 1000 '
-  local k v=0 pc
-  for k in $_hist_fuzzy_hits; do
-    if (( k == 1 )); then
-      (( v += 2 ))                                   # 行首加倍
+  local bound_k bound_v=0 bound_pc
+  for bound_k in $_hist_fuzzy_hits; do
+    if (( bound_k == 1 )); then
+      (( bound_v += 2 ))                             # 行首加倍
     else
-      pc=${_hist_fuzzy_cand[k-1]}
-      [[ -z $pc || $pc != [[:alnum:]_.] ]] && (( v += 1 ))
+      bound_pc=${_hist_fuzzy_cand[bound_k-1]}
+      [[ -z $bound_pc || $bound_pc != [[:alnum:]_.] ]] && (( bound_v += 1 ))
     fi
   done
-  _hist_fuzzy_dim_val=$v'
+  _hist_fuzzy_dim_val=$bound_v'
 
 # 查询里的「空格」命中了候选里的空格 —— 说明两边分词结构对齐
 _hist_fuzzy_dim_add space 1500 '
-  local k v=0
-  for (( k = 1; k <= ${#_hist_fuzzy_qchr}; k++ )); do
-    [[ $_hist_fuzzy_qchr[k] == " " ]] && (( v += 1 ))
+  local space_k space_v=0
+  for (( space_k = 1; space_k <= ${#_hist_fuzzy_qchr}; space_k++ )); do
+    [[ $_hist_fuzzy_qchr[space_k] == " " ]] && (( space_v += 1 ))
   done
-  _hist_fuzzy_dim_val=$v'
+  _hist_fuzzy_dim_val=$space_v'
 
 # 查询里的标点命中了候选里的标点 —— 路径 / 选项结构对齐
 _hist_fuzzy_dim_add punct 800 '
-  local k v=0 c
-  for (( k = 1; k <= ${#_hist_fuzzy_qchr}; k++ )); do
-    c=$_hist_fuzzy_qchr[k]
-    [[ $c != [[:alnum:]] && $c != " " ]] && (( v += 1 ))
+  local punct_k punct_v=0 punct_c
+  for (( punct_k = 1; punct_k <= ${#_hist_fuzzy_qchr}; punct_k++ )); do
+    punct_c=$_hist_fuzzy_qchr[punct_k]
+    [[ $punct_c != [[:alnum:]] && $punct_c != " " ]] && (( punct_v += 1 ))
   done
-  _hist_fuzzy_dim_val=$v'
+  _hist_fuzzy_dim_val=$punct_v'
 
 # ---- 词级缩写匹配（b k -> build kernel，d mes -> dmesg）----
 # 查询词按顺序去「消耗」候选的单词：每个查询词必须是某个单词开头（或某个单词
@@ -416,6 +418,10 @@ _hist_fuzzy_build() {
   # 下一级 L5 直接复用，避免同一批候选第二次遍历 + 第二次打分。
   local -A carry_map
   local -a carry_cand=()
+  # 以下变量在下面的循环里反复使用，必须在这里集中声明一次
+  local limit slack sc
+  local -i n
+  local -a ordered
 
   for name in A0 A1 A2 A3 A4 A5 A6; do
     if [[ $name == A4 ]]; then                       # L4 缩写：惰性计算
@@ -435,10 +441,10 @@ _hist_fuzzy_build() {
     fi
     (( ${#grp} )) || { (( level += 1 )); continue; }
 
-    local limit=$budget
+    limit=$budget
     (( level >= 4 )) && limit=$HIST_FUZZY_LOOSE_LIMIT        # 宽泛档位用更小预算
     rest2=()
-    local -i n=0
+    n=0
     for cand in $grp; do
       (( ${seen[(I)${cand}]} )) && continue                  # 高级已收录
       rest2+=($cand)
@@ -448,12 +454,11 @@ _hist_fuzzy_build() {
     (( ${#rest2} )) || { (( level += 1 )); continue; }
 
     # 该级内部：多维打分排序
-    local slack=$(( ${#q} + HIST_FUZZY_SPAN_SLACK ))
+    slack=$(( ${#q} + HIST_FUZZY_SPAN_SLACK ))
     tmp2=()
     idx=0
     for cand in $rest2; do
       idx=$(( idx + 1 ))
-      local sc
       if [[ $name == A5 ]]; then
         sc=${carry_map[$cand]:-0}                            # L4 已经打过分
       else
@@ -480,7 +485,6 @@ _hist_fuzzy_build() {
 
     # 注意：只有真正入选的才进 seen。被本级拒掉（如 L4 判不是完整缩写、
     # L6 判太松散）的命令，在更低一级里仍应出现，不能提前消耗掉。
-    local -a ordered
     ordered=(${${(O)tmp2}#* })
     (( ${#ordered} )) && { final+=($ordered); seen+=($ordered); }
 
