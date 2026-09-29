@@ -3,7 +3,7 @@
 #  history_fuzzy.zsh  -  常驻式实时历史模糊下拉（zsh 原生）
 #
 #  行为：
-#    * 在提示符行首输入任意字符（无空格）即在下方列出匹配的历史命令
+#    * 输入任意字符（含空格的多词查询也支持）即在下方列出匹配的历史命令
 #    * 每敲一个键全量重算重排，最多 HIST_FUZZY_MAX_SHOW(默认10) 条
 #    * 分级 + 多维打分（见下方「匹配规则」）
 #    * Enter 只执行当前输入行，下拉仅作参考（不会误执行历史命令）
@@ -11,25 +11,31 @@
 #    * 历史只扫描最近 HIST_FUZZY_MAX_HIST(默认1000) 条
 #
 #  ------------------------------------------------------------
-#  匹配规则（模块 B，独立打分，可单独测试）
+#  匹配规则（模块 C，独立打分，可单独测试）
 #  ------------------------------------------------------------
 #  级别由高到低（级别差永远压倒一切，低级不可能越过高级）：
 #    L0 全词     cmd == query
 #    L1 前缀     cmd 以 query 开头
-#    L2 词首     分隔符(/ 空格 - 等)后紧跟 query 前缀，如 "cd build" 的 build
-#    L3 子串     cmd 任意位置含 query
-#    L4 子序列   *q*u*e*r*y* —— 最容易产生噪音，额外受跨度门槛约束
+#    L2 词首     分隔符(/ 空格 - 等)后紧跟 query，如 "cd build" 的 build
+#    L3 子串     cmd 任意位置含 query（含空格的查询也照样匹配）
+#    L4 多词     查询按空格拆成若干词，cmd 里按顺序都出现：
+#                "git com" -> *git*com*，可命中 "git commit -m x"
+#    L5 子序列   *q*u*e*r*y*（逐字符，空格也算一个字符）— 最容易产生噪音，
+#                额外受跨度门槛约束，并且是唯一用暗灰色标示的档位
 #
 #  同级别内的多维打分（越大越靠前）：
 #    + w_consec  相邻字符连续命中数（连续段越多越好）
 #    + w_bound   命中字符落在词边界/行首的数量（词义相关度）
+#    + w_space   查询里的「空格」在 cmd 里也命中了空格 —— 说明分词结构对齐，
+#                语义权重最高（这是独立的一个维度，不是普通字符）
+#    + w_punct   查询里的 / - _ . : = @ 等标点在 cmd 里命中同类字符 —— 结构对齐
 #    - w_span    匹配跨度（首命中到末命中的距离，越小越紧凑）
 #    - w_pos     首个命中字符的位置（越靠前越好）
 #    - w_len     命令长度（同分时短的优先）
 #  都相同时 → 最近使用优先（缓存下标小的在前）
 #
-#  权重全部可调；想退化成「纯最近使用优先」把四个 w_* 设成 0 即可。
-#  L4 额外门槛：跨度 > 查询长度 + HIST_FUZZY_SPAN_SLACK 的直接丢弃。
+#  权重全部可调；想退化成「纯最近使用优先」把 w_* 设成 0 即可。
+#  L5 额外门槛：跨度 > 查询长度 + HIST_FUZZY_SPAN_SLACK 的直接丢弃。
 #
 #  渲染：POSTDISPLAY（默认，列表在输入行下方）或 PREDISPLAY（上方）
 #        都由 zle 负责重绘与清除，不抢终端、不破坏回滚缓冲
@@ -45,11 +51,13 @@
 
 # ---------- 模块 A：加载控制 ----------
 # 用版本号而不是布尔量：改完文件再 source 能热替换，"source 了却没生效"的问题不再有
-(( ${_HIST_FUZZY_VERSION:-0} >= 3 )) && return 0
-typeset -g _HIST_FUZZY_VERSION=3
+(( ${_HIST_FUZZY_VERSION:-0} >= 4 )) && return 0
+typeset -g _HIST_FUZZY_VERSION=4
 
 # ---------- 参数 ----------
-: ${HIST_FUZZY_MAX_HIST:=1000}
+: ${HIST_FUZZY_MAX_HIST:=10000}                   # 扫描最近多少条历史；实测全量(50000)
+                                                  #   去重后约 2180 条唯一命令，单次匹配
+                                                  #   10~35ms（见文件头注释），可接受
 : ${HIST_FUZZY_MAX_SHOW:=10}
 : ${HIST_FUZZY_MIN_LEN:=1}
 : ${HIST_FUZZY_COLOR_TOP:=fg=green,bold}
@@ -59,11 +67,14 @@ typeset -g _HIST_FUZZY_VERSION=3
 : ${HIST_FUZZY_FUZZY_MAX:=4}                      # L4 子序列最多补几条；设 0 = 完全不要
 : ${HIST_FUZZY_FUZZY_MIN_LEN:=2}                  # 少于几个字符不做 L4
 : ${HIST_FUZZY_SPAN_SLACK:=3}                     # L4 松散容忍：跨度 <= 查询长度 + 该值
-: ${HIST_FUZZY_SCORE_LIMIT:=400}                  # 单级最多给多少条打分（性能护栏）
+: ${HIST_FUZZY_SCORE_LIMIT:=200}                  # 单级最多给多少条打分（性能护栏：
+                                                  #   全量历史时调小=更快，调大=排序更准）
 # 打分权重
 : ${HIST_FUZZY_W_LEVEL:=100000}                   # 每差一级的权重差
 : ${HIST_FUZZY_W_CONSEC:=2000}                    # 连续命中
 : ${HIST_FUZZY_W_BOUND:=1000}                     # 词边界命中
+: ${HIST_FUZZY_W_SPACE:=1500}                     # 空格命中（分词结构对齐，独立维度）
+: ${HIST_FUZZY_W_PUNCT:=800}                      # 标点命中（/ - _ . : = @ 等结构对齐）
 : ${HIST_FUZZY_W_SPAN:=50}                        # 跨度惩罚
 : ${HIST_FUZZY_W_POS:=20}                         # 首命中位置惩罚
 : ${HIST_FUZZY_W_LEN:=1}                          # 命令长度惩罚
@@ -77,8 +88,9 @@ typeset -ga _hist_fuzzy_cache                     # 历史缓存：最新在前�
 typeset -ga _hist_fuzzy_result                    # 当前匹配结果
 typeset -ga _hist_fuzzy_hl                        # 本次添加的 region_highlight
 typeset -ga _hist_fuzzy_qpat                      # 查询拆成的单字符 pattern
+typeset -ga _hist_fuzzy_qchr                      # 查询拆成的单字符（原样）
 typeset -g  _hist_fuzzy_last_histcmd=0
-typeset -g  _hist_fuzzy_n_loose=0                 # 结果里 L4(子序列)项从第几条开始
+typeset -g  _hist_fuzzy_n_loose=0                 # 结果里 L5(子序列)项从第几条开始
 typeset -g  _hist_fuzzy_sc=0                      # _hist_fuzzy_score 的输出
 typeset -g  _hist_fuzzy_span=0                    # _hist_fuzzy_score 的副产物
 typeset -g  _hist_fuzzy_prev_key=''
@@ -108,13 +120,17 @@ _hist_fuzzy_refresh() {
     h=($h2)
   fi
 
-  local -aU u
-  u=(${(Oa)h})                                       # 最新在前 + 去重保留最新
+  local -a h2
+  h2=(${(Oa)h})                                      # 最新在前
 
+  # 先规范化再最后去重：否则 "git commit" 和 "git commit " 会被当成两条
   local -a out=()
   local x cmd0
-  for x in $u; do
-    x=${x%"${x##*[![:space:]]}"}                     # 去尾部空白（否则同一条命令算成两条）
+  for x in $h2; do
+    x=${x%"${x##*[![:space:]]}"}                     # 去尾部空白
+    x=${x//$'\t'/ }                                  # tab 统一成空格
+    while [[ $x == *'  '* ]]; do x=${x//'  '/ }; done   # 压缩连续空格
+    [[ $x == *[[:cntrl:]]* ]] && continue            # 含控制字符的脏记录
     [[ -z ${x//[[:space:]]/} ]] && continue          # 空行
     [[ $x == [\|\&\;]* ]] && continue                # 多行命令被拆出的续行片段
     [[ $x == *$'\\n'* ]] && continue                 # 多行命令
@@ -123,7 +139,10 @@ _hist_fuzzy_refresh() {
     (( ${HIST_FUZZY_IGNORE[(I)${cmd0}]} )) && continue
     out+=($x)
   done
-  _hist_fuzzy_cache=(${out[1,HIST_FUZZY_MAX_HIST]})
+
+  local -aU u
+  u=($out)                                           # 去重，保留最新的那条
+  _hist_fuzzy_cache=(${u[1,HIST_FUZZY_MAX_HIST]})
 }
 
 # ============================================================
@@ -134,12 +153,15 @@ _hist_fuzzy_refresh() {
 # ============================================================
 _hist_fuzzy_score() {
   local cand=$1
-  local -a qp
-  qp=($_hist_fuzzy_qpat)
-  local rest=$cand pat pc
-  local abs=0 p prev=-1 first=0 last=0 consec=0 bound=0 i=0 ok=1
+  local -a qp qc
+  qp=($_hist_fuzzy_qpat)                             # 查询字符（已转义成 pattern）
+  qc=($_hist_fuzzy_qchr)                             # 查询字符（原样，用于判定字符类型）
+  local rest=$cand pat pc ch
+  local abs=0 p prev=-1 first=0 last=0 consec=0 bound=0 nsp=0 npun=0 ok=1
+  local i
 
-  for pat in $qp; do
+  for (( i = 1; i <= ${#qp}; i++ )); do
+    pat=$qp[i]; ch=$qc[i]
     p=${rest[(i)$pat]}                               # 剩余串中下一个查询字符的位置
     (( p > ${#rest} )) && { ok=0; break; }           # 有一个字符找不到 → 非子序列
     abs=$(( abs + p ))
@@ -150,11 +172,14 @@ _hist_fuzzy_score() {
     elif [[ -z $pc || $pc != [[:alnum:]_.] ]]; then
       (( bound += 1 ))                               # 词边界
     fi
-    (( i == 0 )) && first=$abs
+    # ---- 字符类型维度（空格/标点单独计权，不按普通字符处理）----
+    if   [[ $ch == ' ' ]];        then (( nsp  += 1 ))   # 空格命中：分词结构对齐
+    elif [[ $ch != [[:alnum:]] ]]; then (( npun += 1 ))  # 标点命中：路径/选项结构对齐
+    fi
+    (( i == 1 )) && first=$abs
     last=$abs
     prev=$abs
     rest=${rest[p+1,-1]}
-    (( i += 1 ))
   done
   (( ok )) || return 1
 
@@ -162,6 +187,8 @@ _hist_fuzzy_score() {
   _hist_fuzzy_sc=$(( HIST_FUZZY_BASE_SCORE
                      + consec * HIST_FUZZY_W_CONSEC
                      + bound  * HIST_FUZZY_W_BOUND
+                     + nsp    * HIST_FUZZY_W_SPACE
+                     + npun   * HIST_FUZZY_W_PUNCT
                      - _hist_fuzzy_span * HIST_FUZZY_W_SPAN
                      - first * HIST_FUZZY_W_POS
                      - ${#cand} * HIST_FUZZY_W_LEN ))
@@ -179,34 +206,55 @@ _hist_fuzzy_build() {
 
   (( ${#_hist_fuzzy_cache} )) || _hist_fuzzy_refresh
   (( ${#q} < HIST_FUZZY_MIN_LEN )) && return 1
-  [[ $q == *[[:space:]]* ]] && return 1               # 只在行首命令位置
+  # 注意：含空格的查询照样匹配（空格参与打分，见模块 C 的 w_space）
 
-  # 查询预处理：拆成转义后的单字符 pattern
+  # 查询预处理：拆成转义后的单字符 pattern + 原字符（判定空格/标点用）
   local -a cs
   cs=(${(s::)q})
   local c
-  _hist_fuzzy_qpat=()
-  for c in $cs; do _hist_fuzzy_qpat+=(${(b)c}); done
+  _hist_fuzzy_qpat=(); _hist_fuzzy_qchr=()
+  for c in $cs; do _hist_fuzzy_qpat+=(${(b)c}); _hist_fuzzy_qchr+=($c); done
 
   local qp=${(b)q}
   local fpat="*${(j:*:)_hist_fuzzy_qpat}*"
 
-  # ---- 五级候选（glob 预筛，cache 顺序 = 最近使用顺序）----
-  local -a A0 A1 A2 A3 A4
-  A0=(${(M)_hist_fuzzy_cache:#${~qp}})                       # L0 全词
-  A1=(${(M)_hist_fuzzy_cache:#${~qp}*})                      # L1 前缀
-  A2=(${(M)_hist_fuzzy_cache:#*[^[:alnum:]_.]${~qp}*})       # L2 词首
+  # 查询按空格拆出的词（L4 多词匹配用）
+  local -a toks tpat
+  toks=(${=q})
+  tpat=()
+  for c in $toks; do tpat+=(${(b)c}); done
+
+  # ---- 分级候选 ----
+  # 性能关键：只对缓存做「一次」子串 glob，L0/L1/L2 都从这个子集里再筛
+  # （L0/L1/L2 必然是 L3 的子集），避免对全量缓存重复扫描 4 次。
+  local -a A0 A1 A2 A3
   A3=(${(M)_hist_fuzzy_cache:#*${~qp}*})                     # L3 子串
-  (( ${#q} >= HIST_FUZZY_FUZZY_MIN_LEN )) && \
-    A4=(${(M)_hist_fuzzy_cache:#${~fpat}})                   # L4 子序列
+  local x
+  for x in $A3; do                                           # 一次遍历分三档
+    if   [[ $x == $q ]]; then                     A0+=($x)   # L0 全词
+    elif [[ $x == $q* ]]; then                    A1+=($x)   # L1 前缀
+    elif [[ $x == *[^[:alnum:]_.]$q* ]]; then     A2+=($x)   # L2 词首
+    fi
+  done
+  # L4 多词、L5 子序列比较贵，且只在前面几档不够时才用 → 放到循环里惰性计算
 
   local -a seen=() final=()
   local -i level=0
   local name cand idx
   local -a grp rest2 tmp2
 
-  for name in A0 A1 A2 A3 A4; do
-    grp=(${(P)name})
+  for name in A0 A1 A2 A3 A4 A5; do
+    if [[ $name == A4 ]]; then                       # L4 多词：惰性计算
+      (( ${#toks} > 1 )) || { (( level += 1 )); continue; }
+      (( ${#final} >= HIST_FUZZY_MAX_SHOW )) && break
+      grp=(${(M)_hist_fuzzy_cache:#*${(j:*:)tpat}*})
+    elif [[ $name == A5 ]]; then                     # L5 子序列：惰性计算
+      (( ${#q} >= HIST_FUZZY_FUZZY_MIN_LEN )) || { (( level += 1 )); continue; }
+      (( ${#final} >= HIST_FUZZY_MAX_SHOW )) && break
+      grp=(${(M)_hist_fuzzy_cache:#${~fpat}})
+    else
+      grp=(${(P)name})
+    fi
     (( ${#grp} )) || { (( level += 1 )); continue; }
 
     rest2=()
@@ -219,23 +267,23 @@ _hist_fuzzy_build() {
     done
     (( ${#rest2} )) || { (( level += 1 )); continue; }
 
-    # 该级内部：多维打分排序；L4 额外受跨度门槛约束
+    # 该级内部：多维打分排序；L5(子序列) 才额外受跨度门槛约束
     local slack=$(( ${#q} + HIST_FUZZY_SPAN_SLACK ))
     tmp2=()
     idx=0
     for cand in $rest2; do
       idx=$(( idx + 1 ))
       _hist_fuzzy_score "$cand" || continue
-      if (( level == 4 )); then
+      if (( level == 5 )); then
         (( _hist_fuzzy_span > slack )) && continue           # 太松散，丢掉
-        (( ${#tmp2} >= HIST_FUZZY_FUZZY_MAX )) && break      # L4 最多补这么几条
+        (( ${#tmp2} >= HIST_FUZZY_FUZZY_MAX )) && break      # L5 最多补这么几条
       fi
-      local sc=$(( _hist_fuzzy_sc + (4 - level) * HIST_FUZZY_W_LEVEL ))
+      local sc=$(( _hist_fuzzy_sc + (5 - level) * HIST_FUZZY_W_LEVEL ))
       # key = 分数(降序) + 缓存下标补数(降序 ⇒ 最近使用在前)
       tmp2+=("${(l:6::0:)sc}${(l:4::0:)$(( 10000 - idx ))} $cand")
     done
 
-    if (( level == 4 )); then _hist_fuzzy_n_loose=${#final}
+    if (( level == 5 )); then _hist_fuzzy_n_loose=${#final}
     else _hist_fuzzy_n_loose=$(( HIST_FUZZY_MAX_SHOW + 1 )); fi
 
     local -a ordered
@@ -255,8 +303,9 @@ _hist_fuzzy_build() {
 #  模块 E：渲染
 # ============================================================
 _hist_fuzzy_clear() {
-  PREDISPLAY=''
-  POSTDISPLAY=''
+  # 注意：补全菜单(menu-select)上下文里 PREDISPLAY/POSTDISPLAY 是只读的，
+  # 直接赋值会报 read-only variable 并把菜单打断，所以必须吞掉错误
+  { PREDISPLAY=''; POSTDISPLAY=''; } 2>/dev/null
   if (( ${#_hist_fuzzy_hl} )); then
     local -a keep=()
     local r
@@ -337,9 +386,7 @@ _hist_fuzzy_trigger() {
   local key="$BUFFER|$CURSOR|$_hist_fuzzy_last_histcmd|${#POSTDISPLAY}|${#PREDISPLAY}"
   [[ $key == $_hist_fuzzy_prev_key ]] && return 0
   _hist_fuzzy_clear
-  if [[ -n $LBUFFER \
-     && $LBUFFER != *[[:space:]]* \
-     && ${#LBUFFER} -ge $HIST_FUZZY_MIN_LEN ]]; then
+  if [[ -n $LBUFFER && ${#LBUFFER} -ge $HIST_FUZZY_MIN_LEN ]]; then
     _hist_fuzzy_build && _hist_fuzzy_render
   fi
   # 记录渲染「之后」的真实状态：列表一旦被别的插件清掉，下一次重绘就能自愈
@@ -378,7 +425,7 @@ if [[ -o interactive ]] && zle -l >/dev/null 2>&1; then
   (( ${+functions[_zsh_autosuggest_fetch]} )) && [[ -z $HIST_FUZZY_ALLOW_ASYNC ]] && \
     unset ZSH_AUTOSUGGEST_USE_ASYNC
 
-  zle -C hist-fuzzy-menu menu-select _generic
+  zle -C hist-fuzzy-menu menu-select _hist_fuzzy_complete
   zstyle ':completion:hist-fuzzy-menu:*' completer _hist_fuzzy_complete
   zstyle ':completion:hist-fuzzy-menu:*' matcher-list ''
   zstyle ':completion:hist-fuzzy-menu:*' format '%F{blue}history%f'
