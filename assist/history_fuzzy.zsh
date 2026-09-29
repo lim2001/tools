@@ -1,69 +1,88 @@
 #!/usr/bin/env zsh
 # ============================================================
-#  history_fuzzy.zsh  -  常驻式实时历史模糊下拉（zsh 原生）
+#  需求与算法总览（改这个文件之前先读完这一段；AI 请以此段为准）
+# ============================================================
+#  【这是什么】一个纯 zsh 原生的「历史命令实时下拉」：在命令行下方常驻，
+#  边打字边列出最可能想执行的历史命令，选中即填入命令行。不依赖 fzf / tmux。
 #
-#  行为：
-#    * 输入任意字符（含空格的多词查询也支持）即在下方列出匹配的历史命令
-#    * 每敲一个键全量重算重排，最多 HIST_FUZZY_MAX_SHOW(默认10) 条
-#    * 分级 + 多维打分（维度彼此解耦，见下方「匹配规则」）
-#    * Enter 只执行当前输入行，下拉仅作参考（不会误执行历史命令）
-#    * 选中某一条（三选一）：
-#        Ctrl-X 1..9  把列表第 N 条直接填进命令行 —— 不依赖终端，随时可用（推荐）
-#        Ctrl-X f     大面板模式（需要装 fzf）：支持鼠标点击、滚轮、继续输入
-#        鼠标直接点   实验性，默认关闭。zle 会吞掉 \e[M 的坐标字节导致读不到，
-#                    详见模块 E2；想试就在 source 前加 HIST_FUZZY_MOUSE=auto
-#    * 历史只扫描最近 HIST_FUZZY_MAX_HIST(默认10000) 条
+#  【需求 —— 这几条是底线，任何改动都不能破坏】
+#   R1 实时：每敲一个键全量重算重排，不能有可感知卡顿（实测 10~50ms/次，2000+ 条历史）
+#   R2 安全：回车永远只执行「当前输入行」，下拉只是参考，绝不误执行历史命令
+#   R3 选中即填：选中的那条必须整条填进 BUFFER、光标落到末尾 —— 回车即执行
+#   R4 兼容：不许弄坏 zsh 原生补全（Tab / menu-select），也不许吞掉其它插件
+#           写在首行的东西（zsh-autosuggestions 的行内灰字建议）。两者要能共存：
+#           补全菜单激活时列表让位；行内建议接在光标后面，列表画在它下一行起
+#   R5 可解释：排序必须能按「级别 → 打分维度」拆开讲清楚，方便调权重
 #
-#  ------------------------------------------------------------
-#  匹配规则
-#  ------------------------------------------------------------
-#  级别（level）由高到低，级别差永远压倒打分，低级不可能越过高级：
-#    L0 全词     cmd == query
-#    L1 前缀     cmd 以 query 开头
-#    L2 词首     分隔符(/ - 空格 等)后紧跟 query，如 "cd build" 的 build
-#    L3 子串     cmd 任意位置含 query（含空格的查询也照样匹配）
-#    L4 缩写     查询按空格拆词，每个词都命中 cmd 某个单词的开头
-#                "b k" -> "./build.sh kernel"      "bu kernel" 同理
+#  【匹配算法】两阶段：先分级，再在同级内打分
+#   阶段一 · 分级（level 差永远压倒打分，低级不可能越过高级）
+#     L0 全词    cmd == query
+#     L1 前缀    cmd 以 query 开头
+#     L2 词首    分隔符(/ - 空格 等)后紧跟 query，如 "cd build" 里的 build
+#     L3 子串    cmd 任意位置含 query（含空格的查询也照样匹配）
+#     L4 缩写    查询按空格拆词，每个词都命中 cmd 某个单词的开头
+#                "b k" / "bu kernel" -> "./build.sh kernel"
 #                ——对应「只记得每个词开头几个字母」的自然输入习惯
-#    L5 多词     每个 query 词在 cmd 里按顺序出现（位置不限）：
+#     L5 多词    每个 query 词在 cmd 里按顺序出现（位置不限）
 #                "git com" -> *git*com*，可命中 "git commit -m x"
-#    L6 子序列   *q*u*e*r*y*（逐字符，空格也算字符）— 噪音最大，额外受跨度门槛约束
+#     L6 子序列  *q*u*e*r*y*（逐字符，空格也算字符）——噪音最大，
+#                额外门槛：跨度 > 查询长度 + HIST_FUZZY_SPAN_SLACK 的直接丢弃
+#   阶段二 · 同级别内打分（各「维度」加权求和；维度彼此完全解耦）
+#     每个维度只是一段代码片段，读约定变量、把结果写进 _hist_fuzzy_dim_val，
+#     不感知其它维度的存在；全部维度会被编译进同一个函数里，零函数调用开销。
+#     求值上下文里已经备好：$cand(候选) $hits(命中位置) $toks(查询词) $first $span
+#     内置维度（+ 越大越好 / - 越小越好）：
+#       + consec 相邻命中（连续段越长越好）
+#       + bound  命中字符落在单词边界或行首的数量（行首加倍）
+#       + space  查询里的「空格」在 cmd 里也命中空格 → 分词结构对齐
+#       + punct  查询里的 / - _ . : = @ 等标点命中同类字符 → 结构对齐
+#       + abbrev 查询词里有多少个命中了 cmd 某个单词的开头
+#       - span   匹配跨度（首命中到末命中的距离，越小越紧凑）
+#       - pos    首个命中字符的位置（越靠前越好）
+#       - len    cmd 长度（同分时短的优先）
+#     完全相同时 → 最近使用优先（缓存下标小的在前）
+#     追加自定义维度（不动任何已有维度）：
+#       _hist_fuzzy_dim_add mydim 600 '# 可读写 $cand / $hits / $toks
+#                                        结果放进 _hist_fuzzy_dim_val'
+#     权重全部可调；想退化成「纯最近使用优先」把各 W_* 设成 0 即可。
 #
-#  同级别内用打分排序。打分由若干「维度」加权求和，维度之间完全解耦：
-#  每个维度只是一段代码片段，读写约定的几个变量，不感知其他维度的存在。
-#  默认内置这些维度（变量 cand / hits / qc / toks 都已在求值上下文中准备好）：
-#    + consec  相邻命中（连续段越长越好）
-#    + bound   命中字符落在单词边界/行首的数量
-#    + space   查询里的「空格」在 cmd 里也命中空格 → 分词结构对齐
-#    + punct   查询里的 / - _ . : = @ 等标点命中同类字符 → 结构对齐
-#    + abbrev  查询词里有多少个命中了 cmd 某个单词的开头（缩写/首字母）
-#    - span    匹配跨度（首命中到末命中的距离，越小越紧凑）
-#    - pos     首个命中字符的位置（越靠前越好）
-#    - len     cmd 长度（同分时短的优先）
-#  都相同时 → 最近使用优先（缓存下标小的在前）
+#  【渲染与选中】
+#   * 渲染用 POSTDISPLAY（列表在输入行下方，默认）或 PREDISPLAY（上方），
+#     由 zle 负责重绘与清除：不抢终端、不破坏回滚缓冲
+#   * 选中方式：Ctrl-X 1..9（不依赖终端，最可靠）／鼠标直接点／Ctrl-X f 用 fzf 大面板
+#   * 历史只扫描最近 HIST_FUZZY_MAX_HIST 条，且先规范化（去空白/压缩空格）再去重
 #
-#  追加自定义维度（不影响任何已有维度）：
-#    _hist_fuzzy_dim_add mydim 600 '# 可读写 $cand / $hits / $qc
-#                                    结果放进 _hist_fuzzy_dim_val'
-#  权重全部可调；想退化成「纯最近使用优先」把各 W_* 设成 0 即可。
-#  L6 额外门槛：跨度 > 查询长度 + HIST_FUZZY_SPAN_SLACK 的直接丢弃。
+#  【踩过的坑 —— 都是实测结论，别走回头路】
+#   P1 同一个变量名在一个函数里被 local 两次，zsh 会把旧值打印到 stdout
+#      （曾让每敲一键都往终端喷 k=3 / sc=502823）。所以：循环体内不许写 local，
+#      所有变量在函数开头集中声明一次；维度片段里的局部变量要加维度名前缀。
+#   P2 命令替换会把 stdout 截走：$(...) 里发的 \e[6n 查询根本到不了终端。
+#      别用 row0=$(_hist_fuzzy_cursor_row) 这种写法。
+#   P3 zle 部件里 read -k 只能读 zle 自己的输入队列，读不到「部件执行期间才到达」
+#      的数据；部件里 print 的内容也不一定出得了门。所以查光标行只能在
+#      非 zle 上下文（precmd）做，而且要用 read -k（它会临时切 raw 模式；
+#      sysread 在 canonical 模式下读不到不带换行的回复）。
+#   P4 补全菜单（compsys / menu-select）激活时 PREDISPLAY/POSTDISPLAY 是只读的，
+#      直接赋值会报 read-only 并打断菜单 —— 渲染前要先探可写性。
+#   P5 _hist_fuzzy_trigger 里 _hist_fuzzy_clear 必须在「key 没变就 return」之后调用：
+#      clear 会顺手关掉鼠标报告，提前 return 就没人再把它开回来。
 #
-#  渲染：POSTDISPLAY（默认，列表在输入行下方）或 PREDISPLAY（上方）
-#        都由 zle 负责重绘与清除，不抢终端、不破坏回滚缓冲
-#
-#  可调参数（在 source 之前设置，或改完 source 一遍即可热更新）：
-#    HIST_FUZZY_MAX_HIST / MAX_SHOW / MIN_LEN / PLACE
-#    HIST_FUZZY_FUZZY_MAX / FUZZY_MIN_LEN / SPAN_SLACK
-#    HIST_FUZZY_W_LEVEL / W_CONSEC / W_BOUND / W_SPAN / W_POS / W_LEN
-#    HIST_FUZZY_IGNORE（黑名单命令名）
-#
-#  诊断：直接执行 histf-diag [查询词]
+# ============================================================
+#  用法速查
+# ============================================================
+#  选中：Ctrl-X 1..9（填第 N 条）| 鼠标点列表行 | Ctrl-X f（fzf 面板）
+#  诊断：histf-diag [查询词]       现场取证：输入后按 Ctrl-X d 写 /tmp/histf_dump.txt
+#  可调（source 之前设置，改完 source 一遍即热更新）：
+#    HIST_FUZZY_MAX_HIST / MAX_SHOW / MIN_LEN / PLACE / MOUSE
+#    HIST_FUZZY_FUZZY_MAX / FUZZY_MIN_LEN / SPAN_SLACK / SCORE_LIMIT / LOOSE_LIMIT
+#    HIST_FUZZY_W_LEVEL / W_CONSEC / W_BOUND / W_SPACE / W_PUNCT / W_ABBREV
+#    HIST_FUZZY_W_SPAN / W_POS / W_LEN / HIST_FUZZY_IGNORE（黑名单命令名）
 # ============================================================
 
 # ---------- 模块 A：加载控制 ----------
 # 用版本号而不是布尔量：改完文件再 source 能热替换，"source 了却没生效"的问题不再有
-(( ${_HIST_FUZZY_VERSION:-0} >= 5 )) && return 0
-typeset -g _HIST_FUZZY_VERSION=5
+(( ${_HIST_FUZZY_VERSION:-0} >= 6 )) && return 0
+typeset -g _HIST_FUZZY_VERSION=6
 
 # ---------- 参数 ----------
 : ${HIST_FUZZY_MAX_HIST:=10000}                   # 扫描最近多少条历史；实测全量(50000)
@@ -82,10 +101,11 @@ typeset -g _HIST_FUZZY_VERSION=5
                                                   #   全量历史时调小=更快，调大=排序更准）
 : ${HIST_FUZZY_LOOSE_LIMIT:=80}                   # 宽泛档位（L4/L5/L6 和 <=2 字符的查询）
                                                   #   的打分预算：这类查询候选极多，精排没意义
-# 鼠标点选默认是关的。原因见模块 E2：zle 会把 \e[M 后面那 3 个坐标字节读进它自己的
-# 输入队列，widget 里再也 read 不到（实测会卡住），所以纯 zsh 解析坐标不可靠。
-# 想要「鼠标点/滚轮选」请用上面的 Ctrl-X f 面板（需要装 fzf，支持鼠标操作）。
-: ${HIST_FUZZY_MOUSE:=off}                        # off / auto：auto=有列表就开 X10 鼠标报告
+# 鼠标点选：auto = 列表出现就开 X10 鼠标报告，点哪行就把那条填进命令行。
+# 原理与几个绕不过去的坑见模块 E2。代价：鼠标报告开着时，终端的「按住拖选文本」
+# 会被吞（绝大多数终端按住 Shift 拖拽仍可选）；tmux 里要先 set -g mouse on。
+# 终端如果不回 DSR（\e[6n），插件会自动放弃点选并退回纯键盘操作，不会卡。
+: ${HIST_FUZZY_MOUSE:=auto}                       # off / auto
 : ${HIST_FUZZY_MOUSE_TIMEOUT:=0.3}                # 定位光标位置(DSR)的等待秒数
 
 # 打分权重
@@ -120,7 +140,11 @@ typeset -g  _hist_fuzzy_n_loose=0                 # 结果里 L6(子序列)项�
 
 # 鼠标点选状态
 typeset -g  _hist_fuzzy_mouse=0                   # 是否已经让终端进入鼠标报告模式
+typeset -g  _hist_fuzzy_row=1                     # DSR 查到的输入行所在行
+typeset -g  _hist_fuzzy_row_ok=1                  # 终端会不会回 DSR（不会就放弃鼠标点选）
+typeset -g  _hist_fuzzy_row_miss=0                # 连续没回音的次数
 typeset -ga _hist_fuzzy_shown                     # 当前实际画在屏幕上的候选（点击时要按它取）
+typeset -g  _hist_fuzzy_prefix=''                 # 别人（autosuggestions 等）写在 POSTDISPLAY 里的行内建议
 typeset -g  _hist_fuzzy_sc=0                      # _hist_fuzzy_score 的输出
 typeset -g  _hist_fuzzy_span=0                    # _hist_fuzzy_score 的副产物
 typeset -g  _hist_fuzzy_prev_key=''
@@ -527,8 +551,22 @@ _hist_fuzzy_render() {
   (( ${#lines} )) || lines=0
   (( lines < 8 )) && lines=24
   local maxn=$(( lines - 3 ))
+  # 鼠标点选是按「输入行行号 + 第几条」换算的，所以列表一旦放不下、被 zle 滚动，
+  # 行号就对不上了。开鼠标时只画到屏幕底部为止，宁可少显示几条也要能点准。
+  if [[ $HIST_FUZZY_MOUSE != off ]]; then
+    local avail=$(( lines - _hist_fuzzy_row ))
+    (( avail < maxn )) && maxn=$avail
+  fi
   (( maxn < 1 )) && return 1
   (( ${#cands} > maxn )) && cands=(${cands[1,maxn]})
+
+  # 补全菜单(compsys / menu-select)激活时 PREDISPLAY/POSTDISPLAY 是只读的。
+  # 先探一下能不能写，写不进去就说明菜单还开着，这一帧直接让位给它。
+  if [[ $HIST_FUZZY_PLACE == below ]]; then
+    { POSTDISPLAY=$POSTDISPLAY; } 2>/dev/null || return 1
+  else
+    { PREDISPLAY=$PREDISPLAY; } 2>/dev/null || return 1
+  fi
 
   local maxw=$(( ${COLUMNS:-80} - 1 ))
   local line off i=0 col
@@ -546,8 +584,9 @@ _hist_fuzzy_render() {
 
   if [[ $HIST_FUZZY_PLACE == below ]]; then
     # 向下：光标之后（列表在输入行下方）
-    txt=$'\n'
-    off=${#BUFFER}
+    # 第一段是别人的行内建议（紧跟光标），换行之后才是我们的列表
+    txt=${_hist_fuzzy_prefix}$'\n'
+    off=$(( ${#BUFFER} + ${#_hist_fuzzy_prefix} ))
     i=0
     for line in $cands; do
       (( ${#line} > maxw )) && line="${line[1,maxw]}"
@@ -556,7 +595,7 @@ _hist_fuzzy_render() {
       hl+=("$(( off + 1 )) $(( off + 1 + ${#line} )) ${cols[i]}")
       off=$(( off + 1 + ${#line} ))
     done
-    POSTDISPLAY=$txt
+    { POSTDISPLAY=$txt; } 2>/dev/null || return 1
   else
     # 向上：提示符之后、输入行之前（列表在输入行上方）
     off=0
@@ -568,7 +607,7 @@ _hist_fuzzy_render() {
       hl+=("$off $(( off + ${#line} )) ${cols[i]}")
       off=$(( off + ${#line} + 1 ))
     done
-    PREDISPLAY=$txt
+    { PREDISPLAY=$txt; } 2>/dev/null || return 1
   fi
 
   _hist_fuzzy_hl=($hl)
@@ -597,6 +636,7 @@ _hist_fuzzy_render() {
 
 _hist_fuzzy_mouse_on() {
   (( _hist_fuzzy_mouse )) && return 0
+  (( _hist_fuzzy_row_ok )) || return 0             # 终端不回 DSR → 点不准，干脆不接管鼠标
   _hist_fuzzy_mouse=1
   print -rn -- $'\e[?1000h'                        # X10 mouse tracking on
   return 0
@@ -609,19 +649,46 @@ _hist_fuzzy_mouse_off() {
   return 0
 }
 
-# 查询光标当前在第几行（DSR \e[6n -> 终端回 \e[<row>;<col>R）
-_hist_fuzzy_cursor_row() {
-  local ch buf='' tries=$(( HIST_FUZZY_MOUSE_TIMEOUT * 50 ))
-  (( tries < 5 )) && tries=15
+# 查询光标当前在第几行（DSR \e[6n -> 终端回 \e[<row>;<col>R），结果写 $_hist_fuzzy_row
+#
+# 三个坑，都踩过：
+#  1) 不能写成 row0=$(_hist_fuzzy_cursor_row)：命令替换会把 stdout 截走，
+#     查询字节发不到终端，终端也就永远不会回 —— 表现为「点了没反应」。
+#     同理结果不能用 print 回传，只能写全局变量 $_hist_fuzzy_row。
+#     （也不要加 >/dev/tty：zle 部件里那个重定向会失败，查询同样发不出去。）
+#  3) 回复是在 widget 执行期间才到达的，zle 主循环这会儿没在读，
+#     这些字节进不了 zle 的输入队列 —— 所以 read -k 永远读不到，
+#     必须用 sysread 直接从 fd 0 读。
+# 注意：这个查询必须在「非 zle 上下文」做（precmd 里）。
+# zle 部件里往终端写的东西出不去（实测：鼠标部件里 print 的 DSR 查询根本没到终端），
+# 而且部件里 read -k 只能读 zle 自己的输入队列 —— 终端在部件执行期间才送来的回复
+# 进不了那个队列，一样读不到。两条路都堵死，所以只能在 precmd 里问一次存起来。
+_hist_fuzzy_query_row() {
+  (( _hist_fuzzy_row_ok )) || return 1             # 已经判定这个终端不回 DSR
+  local ch buf='' tries=20
   print -rn -- $'\e[6n'
+  # 必须用 read -k：终端这会儿是 canonical 模式，不带换行的回复根本不会被 read()
+  # 交出来（sysread 也一样），read -k 会自己切成 raw 模式读完再恢复
   while (( tries-- > 0 )); do
-    read -t 0.05 -k 1 ch 2>/dev/null || continue
-    buf+=$ch
-    [[ $ch == R ]] && break
+    read -t 0.02 -k 1 ch 2>/dev/null && buf+=$ch
+    [[ $buf == *R* ]] && break
   done
   local nums=${buf//[^0-9\;]/}
-  [[ $buf == *R* && $nums == *\;* ]] || return 1
-  print -r -- ${nums%%;*}
+  if [[ $buf == *R* && $nums == *\;* ]]; then
+    _hist_fuzzy_row_miss=0
+    _hist_fuzzy_row=${nums%%;*}                    # 提示符所在行 = 输入行
+    return 0
+  fi
+  # 没等到回复：它多半只是来晚了。必须把它收干净 —— 否则这几个字节会被 zle
+  # 当成输入插进命令行（表现为命令行里莫名多出 "4R"）
+  tries=6
+  while (( tries-- > 0 )); do
+    read -t 0.05 -k 1 ch 2>/dev/null || break
+  done
+  # 连着 3 次没回音才认定「这个终端不支持」：刚开 shell 那次常常拿不到回复，
+  # 一次失败就永久放弃的话，鼠标点选会莫名其妙失灵
+  (( ++_hist_fuzzy_row_miss >= 3 )) && _hist_fuzzy_row_ok=0
+  return 1
 }
 
 # \e[M 之后还有 3 个字节（按键 / 列 / 行），读完再判断是否点中了列表某行
@@ -636,8 +703,9 @@ function hist-fuzzy-pick-mouse {
   local row=$(( $(( ##${reply[3]} )) - 32 ))       # 行(1 起)
   (( btn < 0 || btn > 3 )) && return 0             # 滚轮等其它事件忽略
 
-  local row0
-  row0=$(_hist_fuzzy_cursor_row 2>/dev/null) || { _hist_fuzzy_mouse_off; return 0; }
+  # 输入行行号是 precmd 时问到并存下来的（见 _hist_fuzzy_query_row），
+  # 列表渲染时也保证过整屏放得下，不会被 zle 滚动挪走
+  local row0=$_hist_fuzzy_row
   _hist_fuzzy_mouse_off
 
   local n=${#_hist_fuzzy_shown}
@@ -648,12 +716,13 @@ function hist-fuzzy-pick-mouse {
   else
     idx=$(( n - (row0 - row) + 1 ))                # 列表在输入行上方
   fi
-  (( idx >= 1 && idx <= n )) || return 0
+  (( idx >= 1 && idx <= n )) || return 0           # 点在列表外面：保持鼠标开着，忽略
 
-  LBUFFER=${_hist_fuzzy_shown[idx]}
-  RBUFFER=''
-  CURSOR=${#LBUFFER}
+  # 填进命令行：光标落到末尾，回车即执行
+  BUFFER=${_hist_fuzzy_shown[idx]}
+  CURSOR=${#BUFFER}
   _hist_fuzzy_clear
+  _hist_fuzzy_shush
   return 0
 }
 
@@ -671,10 +740,11 @@ function hist-fuzzy-pick {
     zle -M "只有 ${#cands} 条候选"
     return 0
   fi
-  LBUFFER=${cands[n]}
-  RBUFFER=''
-  CURSOR=${#LBUFFER}
+  # 填进命令行：光标落到末尾，回车即执行
+  BUFFER=${cands[n]}
+  CURSOR=${#BUFFER}
   _hist_fuzzy_clear
+  _hist_fuzzy_shush
   return 0
 }
 
@@ -714,12 +784,34 @@ function hist-fuzzy-mouse-toggle {
 # ============================================================
 #  模块 F：触发 + 部件
 # ============================================================
+# 刚手动选完（鼠标点 / Ctrl-X n）：把 key 记成「已经渲染过空列表」，
+# 这样下一轮重绘不会立刻又把列表弹回来，得用户继续输入才重新出现
+_hist_fuzzy_shush() {
+  _hist_fuzzy_prev_key="$BUFFER|$CURSOR|$_hist_fuzzy_last_histcmd|0|0"
+}
+
 _hist_fuzzy_trigger() {
   # 同一次按键里被多个入口调用时只算一次；
   # 但 key 里带上列表长度：一旦别的插件偷偷清掉 POSTDISPLAY(zsh-autosuggestions
   # 就会这么干)，key 就变了，下一次重绘会把列表补回来，做到自愈。
   local key="$BUFFER|$CURSOR|$_hist_fuzzy_last_histcmd|${#POSTDISPLAY}|${#PREDISPLAY}"
+  # 状态没变就什么都不做。注意一定要在 _hist_fuzzy_clear 之前返回：
+  # clear 会顺手关掉鼠标报告，提前 return 的话就没人把它再开回来了
+  # （表现为「按了一下无关的键之后，鼠标点选就失灵」）。
   [[ $key == $_hist_fuzzy_prev_key ]] && return 0
+
+  # 行内建议（zsh-autosuggestions 等）也写在 POSTDISPLAY 里。
+  # 先把它抠出来留着，重绘时接在光标后面再换行画列表 —— 两边各占一段，互不覆盖。
+  local sugg=''
+  if [[ $HIST_FUZZY_PLACE == below && -n $POSTDISPLAY ]]; then
+    if [[ -n $_hist_fuzzy_prefix && $POSTDISPLAY == $_hist_fuzzy_prefix* ]]; then
+      sugg=$_hist_fuzzy_prefix                     # 上一帧是我们拼的：只要建议那一段
+    elif [[ $POSTDISPLAY != $'\n'* ]]; then
+      sugg=$POSTDISPLAY                            # 纯别人的内容（我们的列表总是以 \n 开头）
+    fi
+  fi
+  _hist_fuzzy_prefix=$sugg
+
   _hist_fuzzy_clear
   if [[ -n $LBUFFER && ${#LBUFFER} -ge $HIST_FUZZY_MIN_LEN ]]; then
     _hist_fuzzy_build && _hist_fuzzy_render
@@ -740,7 +832,34 @@ _hist_fuzzy_hook_install() {
   zle -N zle-line-pre-redraw _hist_fuzzy_pre_redraw
 }
 
+# ---- 与原生补全（compsys / menu-select）共存 --------------------------------
+# 补全菜单要占屏幕，且激活期间 PREDISPLAY/POSTDISPLAY 是只读的，所以这里包一层：
+# 触发补全前先把列表收起来让位；万一菜单还开着，_hist_fuzzy_render 探测到写不进去
+# 也会自己放弃这一帧，不会打出 read-only 报错、不会打断菜单。
+function _hist_fuzzy_complete_wrapper {
+  local orig=${_hist_fuzzy_orig[$WIDGET]:-}
+  _hist_fuzzy_clear
+  if [[ $orig == user:* ]]; then
+    zle ${orig#user:}                              # 原来的插件实现（链式调用）
+  else
+    zle .$WIDGET                                   # 内建实现
+  fi
+  return 0
+}
+
 if [[ -o interactive ]] && zle -l >/dev/null 2>&1; then
+  # ---- 与 compsys 共存：把这几个补全部件包一层（幂等）----------------------
+  local _w
+  for _w in expand-or-complete menu-complete menu-expand-or-complete \
+            reverse-menu-complete list-choices menu-select complete-word \
+            accept-and-menu-complete; do
+    [[ -z ${widgets[$_w]} ]] && continue
+    [[ ${widgets[$_w]} == user:_hist_fuzzy_complete_wrapper ]] && continue
+    _hist_fuzzy_orig[$_w]=${widgets[$_w]}
+    zle -N $_w _hist_fuzzy_complete_wrapper
+  done
+  unset _w
+
   # ---- 选中方式 1：Ctrl-X 1..9 直接把第 N 条候选填进命令行 ------------------
   # 不依赖终端、不依赖鼠标协议，任何环境都能用
   local _i _hist_fuzzy_cx=$'\x18'                  # ^X 前缀（=Ctrl-X）
@@ -788,6 +907,8 @@ if [[ -o interactive ]] && zle -l >/dev/null 2>&1; then
     _hist_fuzzy_refresh
     _hist_fuzzy_clear
     _hist_fuzzy_hook_install
+    # 鼠标点选要知道输入行在屏幕第几行，只能在非 zle 上下文问；这里顺手问一次
+    [[ $HIST_FUZZY_MOUSE != off ]] && _hist_fuzzy_query_row 2>/dev/null
   }
   (( ${precmd_functions[(I)_hist_fuzzy_precmd]} )) || precmd_functions+=(_hist_fuzzy_precmd)
 
