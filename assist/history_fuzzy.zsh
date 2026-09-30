@@ -49,7 +49,12 @@
 #  【渲染与选中】
 #   * 渲染用 POSTDISPLAY（列表在输入行下方，默认）或 PREDISPLAY（上方），
 #     由 zle 负责重绘与清除：不抢终端、不破坏回滚缓冲
-#   * 选中方式：Ctrl-X 1..9（不依赖终端，最可靠）／鼠标直接点／Ctrl-X f 用 fzf 大面板
+#   * 选中方式：Ctrl-X 1..9（不依赖终端，最可靠）／鼠标（默认开：划过即反显高亮，
+#     点一下即填入命令行，见 HIST_FUZZY_MOUSE）／Ctrl-X f 用 fzf 大面板。
+#     鼠标直接点 zle 列表的原理性代价：zle 只能画字符网格，重绘要整块擦掉重画
+#     （会闪），且鼠标报告开着时拖选文本被吞；想不闪就用 fzf 面板或 Ctrl-X n。
+#   * 终端（WindTerm 等）自带的命令建议下拉是终端原生 GUI，比任何 shell
+#     插件都稳 —— 二者并不冲突，可以同时用。
 #   * 历史只扫描最近 HIST_FUZZY_MAX_HIST 条，且先规范化（去空白/压缩空格）再去重
 #
 #  【踩过的坑 —— 都是实测结论，别走回头路】
@@ -66,6 +71,14 @@
 #      直接赋值会报 read-only 并打断菜单 —— 渲染前要先探可写性。
 #   P5 _hist_fuzzy_trigger 里 _hist_fuzzy_clear 必须在「key 没变就 return」之后调用：
 #      clear 会顺手关掉鼠标报告，提前 return 就没人再把它开回来。
+#   P6 region_highlight 的三个坑（悬停高亮就是被它们联手搞没的）：
+#      a) 颜色规范必须写成 zsh 认得的样子：fg=xxx / bg=xxx / bold / standout ...
+#         写成 fg-black,bg-white 会被 zsh 悄悄换成 none —— 表现是「悬停了却没高亮」。
+#      b) 写进去的偏移量 zsh 会自己挪（实测写 "2 7"，下一帧读出来是 "3 8"；
+#         挪不挪跟当时的 PREDISPLAY/POSTDISPLAY 有关，没有固定规律）。
+#         所以只能「追加后立刻读回来」当凭据，清理时还要连 ±1 的形态一起认。
+#      c) 清理要按区间(起:止)匹配，不能按整串匹配：颜色规范会被 zsh 归一化，
+#         按整串比对必然漏删，条目一帧一帧累积 → 屏幕上出现脏高亮。
 #
 # ============================================================
 #  用法速查
@@ -81,8 +94,8 @@
 
 # ---------- 模块 A：加载控制 ----------
 # 用版本号而不是布尔量：改完文件再 source 能热替换，"source 了却没生效"的问题不再有
-(( ${_HIST_FUZZY_VERSION:-0} >= 6 )) && return 0
-typeset -g _HIST_FUZZY_VERSION=6
+(( ${_HIST_FUZZY_VERSION:-0} >= 9 )) && return 0
+typeset -g _HIST_FUZZY_VERSION=9
 
 # ---------- 参数 ----------
 : ${HIST_FUZZY_MAX_HIST:=10000}                   # 扫描最近多少条历史；实测全量(50000)
@@ -93,6 +106,10 @@ typeset -g _HIST_FUZZY_VERSION=6
 : ${HIST_FUZZY_COLOR_TOP:=fg=green,bold}
 : ${HIST_FUZZY_COLOR_REST:=fg=blue}
 : ${HIST_FUZZY_COLOR_FUZZY:=fg=black,bold}        # L4 子序列项：更暗，一眼能区分
+# 鼠标悬停行的高亮。默认 standout（反显）：不管终端是深底还是浅底都看得见。
+# 注意颜色规范必须是 zsh 认得的写法（fg=xxx / bg=xxx / bold / standout ...）；
+# 写错的规范会被 zsh 悄悄换成 none —— 结果就是「悬停了却没有任何高亮」。
+: ${HIST_FUZZY_COLOR_HOVER:=standout}
 : ${HIST_FUZZY_PLACE:=below}                      # below=列表在输入行下方(默认) / above=上方
 : ${HIST_FUZZY_FUZZY_MAX:=4}                      # L6 子序列最多补几条；设 0 = 完全不要
 : ${HIST_FUZZY_FUZZY_MIN_LEN:=2}                  # 少于几个字符不做 L6
@@ -101,11 +118,16 @@ typeset -g _HIST_FUZZY_VERSION=6
                                                   #   全量历史时调小=更快，调大=排序更准）
 : ${HIST_FUZZY_LOOSE_LIMIT:=80}                   # 宽泛档位（L4/L5/L6 和 <=2 字符的查询）
                                                   #   的打分预算：这类查询候选极多，精排没意义
-# 鼠标点选：auto = 列表出现就开 X10 鼠标报告，点哪行就把那条填进命令行。
-# 原理与几个绕不过去的坑见模块 E2。代价：鼠标报告开着时，终端的「按住拖选文本」
-# 会被吞（绝大多数终端按住 Shift 拖拽仍可选）；tmux 里要先 set -g mouse on。
-# 终端如果不回 DSR（\e[6n），插件会自动放弃点选并退回纯键盘操作，不会卡。
-: ${HIST_FUZZY_MOUSE:=auto}                       # off / auto
+# 鼠标点选：auto = 列表出现即开鼠标报告（1000 按下 + 1003 移动），
+#   鼠标划过列表哪一行，那一行就反显高亮；点一下即填入命令行。
+# 代价（原理性，绕不开）：zle 只能在字符网格里画，重绘要整块擦掉重画 → 列表会闪；
+#   鼠标报告开着时终端的「按住拖选文本」会被吞（多数终端按住 Shift 仍可选；
+#   tmux 里要先 set -g mouse on）。终端不回 DSR（\e[6n）时插件自动放弃点选，
+#   退回纯键盘操作，不会卡死。
+# 受不了闪烁/拖选被吞 → HIST_FUZZY_MOUSE=off，或改用 fzf 大面板（Ctrl-X f）：
+#   fzf 接管整个 tty 自己画 UI，点击/滚轮像素级精准、绝不闪烁；
+#   终端（WindTerm 等）自带的命令建议下拉是原生 GUI 浮层，也可以同时用。
+: ${HIST_FUZZY_MOUSE:=auto}                       # off / auto（默认 auto：悬停高亮 + 点选）
 : ${HIST_FUZZY_MOUSE_TIMEOUT:=0.3}                # 定位光标位置(DSR)的等待秒数
 
 # 打分权重
@@ -127,6 +149,7 @@ typeset -ga HIST_FUZZY_IGNORE
 typeset -ga _hist_fuzzy_cache                     # 历史缓存：最新在前，已去重
 typeset -ga _hist_fuzzy_result                    # 当前匹配结果
 typeset -ga _hist_fuzzy_hl                        # 本次添加的 region_highlight
+typeset -gA _hist_fuzzy_hl_ranges                 # 我们加进 region_highlight 的区间 "起:止"
 typeset -ga _hist_fuzzy_qpat                      # 查询拆成的单字符 pattern
 typeset -ga _hist_fuzzy_qchr                      # 查询拆成的单字符（原样）
 typeset -ga _hist_fuzzy_toks                      # 查询按空格拆出的词
@@ -138,6 +161,12 @@ typeset -g  _hist_fuzzy_wv=0                      # 词级缩写：含散乱惩�
 typeset -g  _hist_fuzzy_last_histcmd=0
 typeset -g  _hist_fuzzy_n_loose=0                 # 结果里 L6(子序列)项从第几条开始
 
+# 现场调试：设了 HIST_FUZZY_DEBUG_LOG 才会写日志，默认完全不落盘
+_hist_fuzzy_dbg() {
+  [[ -n $HIST_FUZZY_DEBUG_LOG ]] && { print -r -- "$*" >> $HIST_FUZZY_DEBUG_LOG; } 2>/dev/null
+  return 0
+}
+
 # 鼠标点选状态
 typeset -g  _hist_fuzzy_mouse=0                   # 是否已经让终端进入鼠标报告模式
 typeset -g  _hist_fuzzy_row=1                     # DSR 查到的输入行所在行
@@ -145,6 +174,7 @@ typeset -g  _hist_fuzzy_row_ok=1                  # 终端会不会回 DSR（不
 typeset -g  _hist_fuzzy_row_miss=0                # 连续没回音的次数
 typeset -ga _hist_fuzzy_shown                     # 当前实际画在屏幕上的候选（点击时要按它取）
 typeset -g  _hist_fuzzy_prefix=''                 # 别人（autosuggestions 等）写在 POSTDISPLAY 里的行内建议
+typeset -g  _hist_fuzzy_hover=0                   # 鼠标悬停在列表第几条（0 = 无）
 typeset -g  _hist_fuzzy_sc=0                      # _hist_fuzzy_score 的输出
 typeset -g  _hist_fuzzy_span=0                    # _hist_fuzzy_score 的副产物
 typeset -g  _hist_fuzzy_prev_key=''
@@ -523,21 +553,59 @@ _hist_fuzzy_build() {
 # ============================================================
 #  模块 E：渲染
 # ============================================================
+# 把 $1 里的条目追加进 region_highlight，并把「zsh 实际存下来的那几条」记进
+# _hist_fuzzy_hl / _hist_fuzzy_hl_ranges。
+#
+_hist_fuzzy_hl_add() {
+  local -i nb=${#region_highlight}
+  region_highlight+=($@)
+  _hist_fuzzy_hl=(${region_highlight[nb+1,-1]})     # 读回真实条目
+  local -a p
+  local r
+  local -i s e
+  for r in $_hist_fuzzy_hl; do
+    p=(${=r})
+    (( ${#p} >= 2 )) || continue
+    s=${p[1]}; e=${p[2]}
+    # 实测 zsh 会在重绘时把偏移量整体挪一格（我们写 "2 7"，下一次读就是 "3 8"，
+    # 而且挪不挪跟当时的 PREDISPLAY/POSTDISPLAY 有关、没有固定规律）。
+    # 所以 ±1 的两种形态都要登记，否则条目删不掉、会一帧一帧累积成脏高亮。
+    _hist_fuzzy_hl_ranges[$s:$e]=1
+    _hist_fuzzy_hl_ranges[$(( s + 1 )):$(( e + 1 ))]=1
+    _hist_fuzzy_hl_ranges[$(( s - 1 )):$(( e - 1 ))]=1
+  done
+  return 0
+}
+
+# 把「我们」加进去的 region_highlight 条目摘掉。
+# 按区间(起:止)匹配而不是按整串匹配：zsh 会把颜色规范归一化（写错还会变成 none），
+# 按整串比对必然漏删，条目会一帧一帧累积在 region_highlight 里（屏幕上出现脏高亮）。
+_hist_fuzzy_hl_drop() {
+  (( ${#_hist_fuzzy_hl_ranges} )) || return 0
+  local -a keep=() p
+  local r
+  for r in $region_highlight; do
+    p=(${=r})
+    if (( ${#p} >= 2 )) && (( ${+_hist_fuzzy_hl_ranges[${p[1]}:${p[2]}]} )); then
+      continue                                     # 我们的条目：丢掉，别人的原样保留
+    fi
+    keep+=($r)
+  done
+  region_highlight=($keep)
+  _hist_fuzzy_hl_ranges=()
+  return 0
+}
+
 _hist_fuzzy_clear() {
   # 注意：补全菜单(menu-select)上下文里 PREDISPLAY/POSTDISPLAY 是只读的，
   # 直接赋值会报 read-only variable 并把菜单打断，所以必须吞掉错误
   { PREDISPLAY=''; POSTDISPLAY=''; } 2>/dev/null
   _hist_fuzzy_mouse_off                            # 列表没了就别再占着鼠标
+  # 注意不要在这里清 _hist_fuzzy_hover：trigger -> clear -> render 会把悬停状态
+  # 抹掉，悬停高亮就永远画不出来（只有真正换了输入时才由 trigger 清）
   _hist_fuzzy_shown=()
-  if (( ${#_hist_fuzzy_hl} )); then
-    local -a keep=()
-    local r
-    for r in $region_highlight; do
-      (( ${_hist_fuzzy_hl[(I)$r]} )) || keep+=($r)
-    done
-    region_highlight=($keep)
-    _hist_fuzzy_hl=()
-  fi
+  _hist_fuzzy_hl_drop
+  _hist_fuzzy_hl=()
 }
 
 _hist_fuzzy_render() {
@@ -553,8 +621,10 @@ _hist_fuzzy_render() {
   local maxn=$(( lines - 3 ))
   # 鼠标点选是按「输入行行号 + 第几条」换算的，所以列表一旦放不下、被 zle 滚动，
   # 行号就对不上了。开鼠标时只画到屏幕底部为止，宁可少显示几条也要能点准。
+  # 光标所在屏幕行要算上长命令的折行偏移（与 hist-fuzzy-pick-mouse 里的算法一致）
   if [[ $HIST_FUZZY_MOUSE != off ]]; then
-    local avail=$(( lines - _hist_fuzzy_row ))
+    local rowc=$(( _hist_fuzzy_row + ( $#PREDISPLAY + CURSOR ) / ${COLUMNS:-80} ))
+    local avail=$(( lines - rowc - 1 ))
     (( avail < maxn )) && maxn=$avail
   fi
   (( maxn < 1 )) && return 1
@@ -569,19 +639,21 @@ _hist_fuzzy_render() {
   fi
 
   local maxw=$(( ${COLUMNS:-80} - 1 ))
-  local line off i=0 col
+  local line off i=0 col r
   local txt=''
-  local -a hl=()
+  local -a hl=() parts
 
   # 颜色：第 1 条高亮最佳匹配；L4 子序列项用暗色标示「凑数」
   local -a cols=()
   for line in $cands; do
     i=$(( i + 1 ))
-    if   (( i == 1 )); then                   cols+=($HIST_FUZZY_COLOR_TOP)
+    if   (( i == _hist_fuzzy_hover )); then   cols+=($HIST_FUZZY_COLOR_HOVER)  # 鼠标悬停
+    elif (( i == 1 )); then                   cols+=($HIST_FUZZY_COLOR_TOP)
     elif (( i <= _hist_fuzzy_n_loose )); then cols+=($HIST_FUZZY_COLOR_REST)
     else                                      cols+=($HIST_FUZZY_COLOR_FUZZY); fi
   done
 
+  _hist_fuzzy_dbg "RENDER n=${#cands} hover=$_hist_fuzzy_hover shown1=[${cands[1]}]"
   if [[ $HIST_FUZZY_PLACE == below ]]; then
     # 向下：光标之后（列表在输入行下方）
     # 第一段是别人的行内建议（紧跟光标），换行之后才是我们的列表
@@ -610,8 +682,7 @@ _hist_fuzzy_render() {
     { PREDISPLAY=$txt; } 2>/dev/null || return 1
   fi
 
-  _hist_fuzzy_hl=($hl)
-  region_highlight+=($hl)
+  _hist_fuzzy_hl_add $hl
 
   # 记下真正画在屏幕上的行，鼠标点击时按它取命令
   _hist_fuzzy_shown=($cands)
@@ -638,14 +709,17 @@ _hist_fuzzy_mouse_on() {
   (( _hist_fuzzy_mouse )) && return 0
   (( _hist_fuzzy_row_ok )) || return 0             # 终端不回 DSR → 点不准，干脆不接管鼠标
   _hist_fuzzy_mouse=1
-  print -rn -- $'\e[?1000h'                        # X10 mouse tracking on
+  # 1003 = 任意移动跟踪：鼠标扫过列表行时终端会持续上报位置，用来做悬停高亮
+  print -rn -- $'\e[?1000h\e[?1003h'
   return 0
 }
 
 _hist_fuzzy_mouse_off() {
   (( _hist_fuzzy_mouse )) || return 0
   _hist_fuzzy_mouse=0
-  print -rn -- $'\e[?1000l'                        # off
+  # 这里不要清 _hist_fuzzy_hover：每次重绘 trigger->clear 都会走到这里，
+  # 一清悬停高亮就永远画不出来。悬停的失效交给 trigger 按「输入是否变了」判断。
+  print -rn -- $'\e[?1003l\e[?1000l'
   return 0
 }
 
@@ -691,7 +765,41 @@ _hist_fuzzy_query_row() {
   return 1
 }
 
-# \e[M 之后还有 3 个字节（按键 / 列 / 行），读完再判断是否点中了列表某行
+# 悬停高亮：只换 region_highlight 里列表条目的颜色，绝不重画列表。
+# 以前走 clear+build+render 整套重绘：鼠标每扫过一行，列表先整块擦掉再重建
+# （build 还要 10~50ms），肉眼看就是列表一闪一闪。只改高亮、不动 POSTDISPLAY
+# 就不会闪 —— zle 换 region_highlight 后 zle -R 只是重新上色。
+# idx 没变的 motion 事件直接忽略（鼠标划过一行会产生一串 motion 事件）。
+_hist_fuzzy_hover_set() {
+  local idx=$1
+  (( idx >= 0 && idx <= ${#_hist_fuzzy_shown} )) || idx=0
+  (( idx == _hist_fuzzy_hover )) && return 0
+  _hist_fuzzy_hover=$idx
+  (( ${#_hist_fuzzy_hl} )) || return 0
+  local -a cols=() parts new=()
+  local r
+  local -i i=0
+  # 每条列表行的「正常颜色」，规则与 _hist_fuzzy_render 一致
+  for r in $_hist_fuzzy_hl; do
+    i=$(( i + 1 ))
+    parts=(${=r})
+    if   (( i == idx )); then                 new+=("${parts[1]} ${parts[2]} $HIST_FUZZY_COLOR_HOVER")
+    elif (( i == 1 )); then                   new+=("${parts[1]} ${parts[2]} $HIST_FUZZY_COLOR_TOP")
+    elif (( i <= _hist_fuzzy_n_loose )); then new+=("${parts[1]} ${parts[2]} $HIST_FUZZY_COLOR_REST")
+    else                                      new+=("${parts[1]} ${parts[2]} $HIST_FUZZY_COLOR_FUZZY"); fi
+  done
+  # 先摘掉我们上一帧的条目（按区间匹配，见 _hist_fuzzy_hl_drop），
+  # 再放回换色后的版本；其它插件（语法高亮等）的条目原样保留
+  _hist_fuzzy_hl_drop
+  _hist_fuzzy_hl_add $new
+  zle -R
+  return 0
+}
+
+# \e[M 之后还有 3 个字节（按键 / 列 / 行），按键字节减 32 后：
+#   0/1/2 = 左中右键按下  -> 点中哪条就把哪条填进命令行
+#   3     = 松开；35 = 鼠标移动（1003 模式）-> 都只做悬停高亮，不选中
+#   其余（滚轮 64/65、带修饰键的按下 4/8/16...）一律忽略
 function hist-fuzzy-pick-mouse {
   local reply=''
   read -k 3 -r reply 2>/dev/null
@@ -699,31 +807,45 @@ function hist-fuzzy-pick-mouse {
     _hist_fuzzy_mouse_off
     return 0
   fi
-  local btn=$(( $(( ##${reply[1]} )) - 32 ))       # 0/1/2 = 左中右键按下，3 = 松开
+  local btn=$(( $(( ##${reply[1]} )) - 32 ))
   local row=$(( $(( ##${reply[3]} )) - 32 ))       # 行(1 起)
-  (( btn < 0 || btn > 3 )) && return 0             # 滚轮等其它事件忽略
+  _hist_fuzzy_dbg "EVT btn=$btn row=$row mouse=$_hist_fuzzy_mouse"
 
-  # 输入行行号是 precmd 时问到并存下来的（见 _hist_fuzzy_query_row），
-  # 列表渲染时也保证过整屏放得下，不会被 zle 滚动挪走
-  local row0=$_hist_fuzzy_row
-  _hist_fuzzy_mouse_off
+  # 光标真实所在的屏幕行 = precmd 存的行号 + 长命令折行的偏移。
+  # 不折算的话，命令一长发生折行，点击就会「错位」点到别的条目上。
+  local row0=$(( _hist_fuzzy_row + ( $#PREDISPLAY + CURSOR ) / ${COLUMNS:-80} ))
 
   local n=${#_hist_fuzzy_shown}
-  (( n )) || return 0
-  local idx
-  if [[ $HIST_FUZZY_PLACE == below ]]; then
-    idx=$(( row - row0 ))                          # 列表在输入行下方：下一行即第 1 条
-  else
-    idx=$(( n - (row0 - row) + 1 ))                # 列表在输入行上方
+  local idx=0
+  if (( n )); then
+    if [[ $HIST_FUZZY_PLACE == below ]]; then
+      idx=$(( row - row0 ))                        # 列表在输入行下方：下一行即第 1 条
+    else
+      idx=$(( n - (row0 - row) + 1 ))              # 列表在输入行上方
+    fi
+    (( idx >= 1 && idx <= n )) || idx=0            # 点/移到列表外面：视为没有悬停目标
   fi
-  (( idx >= 1 && idx <= n )) || return 0           # 点在列表外面：保持鼠标开着，忽略
 
-  # 填进命令行：光标落到末尾，回车即执行
-  BUFFER=${_hist_fuzzy_shown[idx]}
-  CURSOR=${#BUFFER}
-  _hist_fuzzy_clear
-  _hist_fuzzy_shush
-  return 0
+  case $btn in
+    0|1|2)                                         # 按下：选中（光标到末尾，回车即执行）
+      _hist_fuzzy_dbg "  PRESS idx=$idx row0=$row0 shown1=[${_hist_fuzzy_shown[1]}]"
+      (( idx )) || return 0                        # 点在列表外：忽略，鼠标保持开启
+      _hist_fuzzy_mouse_off
+      BUFFER=${_hist_fuzzy_shown[idx]}
+      CURSOR=${#BUFFER}
+      _hist_fuzzy_hover=0                          # 已经选完了，别把悬停状态带进下一轮
+      _hist_fuzzy_clear
+      _hist_fuzzy_shush
+      return 0
+      ;;
+    3|35)                                          # 松开 / 移动：只刷新悬停高亮
+      _hist_fuzzy_dbg "  MOTION idx=$idx hover=$_hist_fuzzy_hover"
+      _hist_fuzzy_hover_set $idx
+      _hist_fuzzy_dbg "  after hover=$_hist_fuzzy_hover"
+      return 0
+      ;;
+    *) return 0 ;;
+  esac
 }
 
 # ---- 把光标处的第 N 条候选直接填进命令行（Ctrl-X 1..9）----
@@ -787,37 +909,55 @@ function hist-fuzzy-mouse-toggle {
 # 刚手动选完（鼠标点 / Ctrl-X n）：把 key 记成「已经渲染过空列表」，
 # 这样下一轮重绘不会立刻又把列表弹回来，得用户继续输入才重新出现
 _hist_fuzzy_shush() {
-  _hist_fuzzy_prev_key="$BUFFER|$CURSOR|$_hist_fuzzy_last_histcmd|0|0"
+  _hist_fuzzy_prev_key="$BUFFER|$CURSOR|$_hist_fuzzy_last_histcmd|0|0|0"
 }
 
 _hist_fuzzy_trigger() {
   # 同一次按键里被多个入口调用时只算一次；
   # 但 key 里带上列表长度：一旦别的插件偷偷清掉 POSTDISPLAY(zsh-autosuggestions
   # 就会这么干)，key 就变了，下一次重绘会把列表补回来，做到自愈。
-  local key="$BUFFER|$CURSOR|$_hist_fuzzy_last_histcmd|${#POSTDISPLAY}|${#PREDISPLAY}"
+  # key 带上悬停行号：鼠标换行悬停时靠它触发重绘换高亮
+  local base="$BUFFER|$CURSOR|$_hist_fuzzy_last_histcmd|${#POSTDISPLAY}|${#PREDISPLAY}"
+  local key="$base|$_hist_fuzzy_hover"
   # 状态没变就什么都不做。注意一定要在 _hist_fuzzy_clear 之前返回：
   # clear 会顺手关掉鼠标报告，提前 return 的话就没人把它再开回来了
   # （表现为「按了一下无关的键之后，鼠标点选就失灵」）。
   [[ $key == $_hist_fuzzy_prev_key ]] && return 0
+  # 除了悬停行号以外其它状态都变了 → 这是新的输入，鼠标悬停位置已经没有意义
+  if [[ $base != ${_hist_fuzzy_prev_key%|*} ]]; then
+    _hist_fuzzy_dbg "CLRHOVER base=[$base] prev=[${_hist_fuzzy_prev_key%|*}]"
+    _hist_fuzzy_hover=0
+  fi
 
   # 行内建议（zsh-autosuggestions 等）也写在 POSTDISPLAY 里。
   # 先把它抠出来留着，重绘时接在光标后面再换行画列表 —— 两边各占一段，互不覆盖。
+  #
+  # 判断依据（必须严格，否则会越滚越大）：
+  #   * 我们渲染的输出 = 建议 + \n + 列表，一定含换行
+  #   * 别人的行内建议是单行（autosuggestions 不换行）
+  # 以前只用「是否以旧前缀开头」判断，结果建议一变（用户继续输入时建议会缩短），
+  # 「建议+旧列表」整块不再以旧前缀开头，就被当成新建议整段保留 ——
+  # 列表从此一帧叠一帧，屏幕上滚出一大块重复内容（用户截图里的上下两大块）。
   local sugg=''
   if [[ $HIST_FUZZY_PLACE == below && -n $POSTDISPLAY ]]; then
-    if [[ -n $_hist_fuzzy_prefix && $POSTDISPLAY == $_hist_fuzzy_prefix* ]]; then
-      sugg=$_hist_fuzzy_prefix                     # 上一帧是我们拼的：只要建议那一段
-    elif [[ $POSTDISPLAY != $'\n'* ]]; then
-      sugg=$POSTDISPLAY                            # 纯别人的内容（我们的列表总是以 \n 开头）
+    if [[ $POSTDISPLAY != *$'\n'* ]]; then
+      sugg=$POSTDISPLAY                            # 单行：是别人的行内建议，接住
+    elif [[ -n $_hist_fuzzy_prefix && $POSTDISPLAY == $_hist_fuzzy_prefix* ]]; then
+      sugg=$_hist_fuzzy_prefix                     # 我们上一帧的输出：只取建议那一段
     fi
+    # 其余情况（多行又对不上上一帧前缀）：是被别的插件改过的混合体，整块丢弃重建
   fi
   _hist_fuzzy_prefix=$sugg
 
   _hist_fuzzy_clear
+  _hist_fuzzy_dbg "TRIG base=[$base] hover=$_hist_fuzzy_hover"
   if [[ -n $LBUFFER && ${#LBUFFER} -ge $HIST_FUZZY_MIN_LEN ]]; then
     _hist_fuzzy_build && _hist_fuzzy_render
   fi
-  # 记录渲染「之后」的真实状态：列表一旦被别的插件清掉，下一次重绘就能自愈
-  _hist_fuzzy_prev_key="$BUFFER|$CURSOR|$_hist_fuzzy_last_histcmd|${#POSTDISPLAY}|${#PREDISPLAY}"
+  # 记录渲染「之后」的真实状态：列表一旦被别的插件清掉，下一次重绘就能自愈。
+  # 格式必须和上面的 key 一致（也含悬停段）—— 否则 base 比较永远不等，
+  # 悬停状态每帧都被当「新输入」清掉，高亮就画不出来（踩过）。
+  _hist_fuzzy_prev_key="$base|$_hist_fuzzy_hover"
   return 0
 }
 
