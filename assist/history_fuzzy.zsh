@@ -49,8 +49,13 @@
 #  【渲染与选中】
 #   * 渲染用 POSTDISPLAY（列表在输入行下方，默认）或 PREDISPLAY（上方），
 #     由 zle 负责重绘与清除：不抢终端、不破坏回滚缓冲
-#   * 选中方式：Ctrl-X 1..9（不依赖终端，最可靠）／鼠标（默认开：划过即反显高亮，
-#     点一下即填入命令行，见 HIST_FUZZY_MOUSE）／Ctrl-X f 用 fzf 大面板。
+#   * 选中方式（WindTerm 风格，列表始终有一条高亮"选中"）：
+#     - ↑/↓ 在候选间移动高亮；→ 或 Ctrl-@ 把高亮那条填进命令行
+#       （只动过选择后 → 才接管理我们的项，没动过时 → 原样放行给光标/autosuggest）
+#     - Ctrl-X 1..9 直接填第 N 条（不依赖终端，最可靠）
+#     - 鼠标：划过即反显高亮，点一下即填入（见 HIST_FUZZY_MOUSE，默认开）
+#     - Ctrl-X f 用 fzf 大面板（装了 fzf 才有）
+#   * 回车永远只执行「当前输入行」（R2），接受历史项请用上面的 ↑↓→ / Ctrl-X / 鼠标
 #     鼠标直接点 zle 列表的原理性代价：zle 只能画字符网格，重绘要整块擦掉重画
 #     （会闪），且鼠标报告开着时拖选文本被吞；想不闪就用 fzf 面板或 Ctrl-X n。
 #   * 终端（WindTerm 等）自带的命令建议下拉是终端原生 GUI，比任何 shell
@@ -79,11 +84,17 @@
 #         所以只能「追加后立刻读回来」当凭据，清理时还要连 ±1 的形态一起认。
 #      c) 清理要按区间(起:止)匹配，不能按整串匹配：颜色规范会被 zsh 归一化，
 #         按整串比对必然漏删，条目一帧一帧累积 → 屏幕上出现脏高亮。
+#   P7 鼠标点选错位（点第 3 个却填了第 5 个）的根因：DSR 光标查询在 precmd 里做，
+#      那一刻光标还在「上一命令输出末尾」，并不是输入行；输入行还要往下挪
+#      「先换一行(若光标不在行首) + 提示符占的行数」。之前漏掉提示符行数，多行提示符
+#      （oh-my-zsh / powerlevel 等）下就整行整行地错。现在用 DSR 回的「列号」判断要不要
+#      先换行，再用 _hist_fuzzy_prompt_lines（展开 PROMPT 数换行）补上提示符行数，
+#      点选行号精确对齐。上方有输出 / 命令折行由 render 里的 wrap 项另行折算。
 #
 # ============================================================
 #  用法速查
 # ============================================================
-#  选中：Ctrl-X 1..9（填第 N 条）| 鼠标点列表行 | Ctrl-X f（fzf 面板）
+#  选中：↑/↓ 移动高亮，→ 或 Ctrl-@ 接受高亮项 | Ctrl-X 1..9（填第 N 条）| 鼠标点列表行 | Ctrl-X f（fzf 面板）
 #  诊断：histf-diag [查询词]       现场取证：输入后按 Ctrl-X d 写 /tmp/histf_dump.txt
 #  可调（source 之前设置，改完 source 一遍即热更新）：
 #    HIST_FUZZY_MAX_HIST / MAX_SHOW / MIN_LEN / PLACE / MOUSE
@@ -94,8 +105,8 @@
 
 # ---------- 模块 A：加载控制 ----------
 # 用版本号而不是布尔量：改完文件再 source 能热替换，"source 了却没生效"的问题不再有
-(( ${_HIST_FUZZY_VERSION:-0} >= 9 )) && return 0
-typeset -g _HIST_FUZZY_VERSION=9
+(( ${_HIST_FUZZY_VERSION:-0} >= 10 )) && return 0
+typeset -g _HIST_FUZZY_VERSION=10
 
 # ---------- 参数 ----------
 : ${HIST_FUZZY_MAX_HIST:=10000}                   # 扫描最近多少条历史；实测全量(50000)
@@ -106,10 +117,11 @@ typeset -g _HIST_FUZZY_VERSION=9
 : ${HIST_FUZZY_COLOR_TOP:=fg=green,bold}
 : ${HIST_FUZZY_COLOR_REST:=fg=blue}
 : ${HIST_FUZZY_COLOR_FUZZY:=fg=black,bold}        # L4 子序列项：更暗，一眼能区分
-# 鼠标悬停行的高亮。默认 standout（反显）：不管终端是深底还是浅底都看得见。
-# 注意颜色规范必须是 zsh 认得的写法（fg=xxx / bg=xxx / bold / standout ...）；
-# 写错的规范会被 zsh 悄悄换成 none —— 结果就是「悬停了却没有任何高亮」。
-: ${HIST_FUZZY_COLOR_HOVER:=standout}
+# 选中行(含鼠标悬停 / 方向键高亮)的高亮。用实打实的背景色，深底浅底都一眼可见；
+# 不要用 standout（有些终端反显太弱、或和已有颜色叠加后看不出来）。
+# 必须是 zsh 认得的规范写法（fg=xxx / bg=xxx / bold / standout ...）；
+# 写错（如 fg-black,bg-white 少了等号）会被 zsh 悄悄换成 none —— 表现为「高亮了却没显示」。
+: ${HIST_FUZZY_COLOR_HOVER:=bg=cyan,fg=black}
 : ${HIST_FUZZY_PLACE:=below}                      # below=列表在输入行下方(默认) / above=上方
 : ${HIST_FUZZY_FUZZY_MAX:=4}                      # L6 子序列最多补几条；设 0 = 完全不要
 : ${HIST_FUZZY_FUZZY_MIN_LEN:=2}                  # 少于几个字符不做 L6
@@ -169,12 +181,14 @@ _hist_fuzzy_dbg() {
 
 # 鼠标点选状态
 typeset -g  _hist_fuzzy_mouse=0                   # 是否已经让终端进入鼠标报告模式
-typeset -g  _hist_fuzzy_row=1                     # DSR 查到的输入行所在行
+typeset -g  _hist_fuzzy_row=1                     # DSR 折算后的「输入行」所在屏幕行（见 _hist_fuzzy_query_row）
 typeset -g  _hist_fuzzy_row_ok=1                  # 终端会不会回 DSR（不会就放弃鼠标点选）
 typeset -g  _hist_fuzzy_row_miss=0                # 连续没回音的次数
 typeset -ga _hist_fuzzy_shown                     # 当前实际画在屏幕上的候选（点击时要按它取）
 typeset -g  _hist_fuzzy_prefix=''                 # 别人（autosuggestions 等）写在 POSTDISPLAY 里的行内建议
-typeset -g  _hist_fuzzy_hover=0                   # 鼠标悬停在列表第几条（0 = 无）
+typeset -g  _hist_fuzzy_hover=0                   # 当前高亮(选中)的列表第几条（0 = 无；渲染时默认置 1）
+typeset -g  _hist_fuzzy_engaged=0                 # 用户是否主动用方向键/鼠标移动过选择（未动则 → 不抢 autosuggest 的接受）
+typeset -g  _hist_fuzzy_prompt_lines=1             # 提示符占几行（用于把 precmd 的 DSR 行号折算成真正的输入行）
 typeset -g  _hist_fuzzy_sc=0                      # _hist_fuzzy_score 的输出
 typeset -g  _hist_fuzzy_span=0                    # _hist_fuzzy_score 的副产物
 typeset -g  _hist_fuzzy_prev_key=''
@@ -613,6 +627,11 @@ _hist_fuzzy_render() {
   cands=($_hist_fuzzy_result)
   (( ${#cands} )) || return 1
 
+  # 默认高亮第 1 条（WindTerm 风格：始终有一条可见的"选中"），让用户一眼知道
+  # 当前会选中哪条；之后鼠标划过 / 方向键移动会改到别的行。
+  (( _hist_fuzzy_hover )) || _hist_fuzzy_hover=1
+  (( _hist_fuzzy_hover > ${#cands} )) && _hist_fuzzy_hover=1
+
   # 屏幕高度不够时自动少显示几条（避免整屏被列表占满）
   # 注意：某些终端/IDE 里 LINES 会是 0 或未导出，必须兜底，否则列表会被静默屏蔽
   local lines=${LINES}
@@ -739,7 +758,7 @@ _hist_fuzzy_mouse_off() {
 # 进不了那个队列，一样读不到。两条路都堵死，所以只能在 precmd 里问一次存起来。
 _hist_fuzzy_query_row() {
   (( _hist_fuzzy_row_ok )) || return 1             # 已经判定这个终端不回 DSR
-  local ch buf='' tries=20
+  local ch buf='' tries=20 r c
   print -rn -- $'\e[6n'
   # 必须用 read -k：终端这会儿是 canonical 模式，不带换行的回复根本不会被 read()
   # 交出来（sysread 也一样），read -k 会自己切成 raw 模式读完再恢复
@@ -750,7 +769,14 @@ _hist_fuzzy_query_row() {
   local nums=${buf//[^0-9\;]/}
   if [[ $buf == *R* && $nums == *\;* ]]; then
     _hist_fuzzy_row_miss=0
-    _hist_fuzzy_row=${nums%%;*}                    # 提示符所在行 = 输入行
+    r=${nums%%;*}; c=${nums##*;}
+    # 关键修正：precmd 此刻光标停在「上一命令输出的末尾」，并不是输入行。
+    # 输入行 = 末尾行 + (若光标不在行首则需先换一行) + (提示符行数 - 1)。
+    # 之前漏掉「提示符行数」，多行提示符（如 oh-my-zsh / powerlevel）下就会整行整行地错，
+    # 表现就是「点第 3 个却填了第 5 个」。现在用 DSR 回的「列号」判断要不要先换行，
+    # 再用 _hist_fuzzy_prompt_lines 把提示符占的行补上，点击行号精确对齐。
+    local fwd=$(( c == 1 ? 0 : 1 ))
+    _hist_fuzzy_row=$(( r + fwd + _hist_fuzzy_prompt_lines - 1 ))
     return 0
   fi
   # 没等到回复：它多半只是来晚了。必须把它收干净 —— 否则这几个字节会被 zle
@@ -811,9 +837,12 @@ function hist-fuzzy-pick-mouse {
   local row=$(( $(( ##${reply[3]} )) - 32 ))       # 行(1 起)
   _hist_fuzzy_dbg "EVT btn=$btn row=$row mouse=$_hist_fuzzy_mouse"
 
-  # 光标真实所在的屏幕行 = precmd 存的行号 + 长命令折行的偏移。
-  # 不折算的话，命令一长发生折行，点击就会「错位」点到别的条目上。
-  local row0=$(( _hist_fuzzy_row + ( $#PREDISPLAY + CURSOR ) / ${COLUMNS:-80} ))
+  # _hist_fuzzy_row 已经是折算后的「输入行」屏幕行（含提示符行数，见 query_row）。
+  # 列表在输入行下方时，输入行若因过长折行会再往下挤，要把折行行数补上；
+  # 列表在输入行上方时不需要补（PREDISPLAY 画在输入行之前）。
+  local wrap=0
+  [[ $HIST_FUZZY_PLACE == below ]] && wrap=$(( ( $#PREDISPLAY + CURSOR ) / ${COLUMNS:-80} ))
+  local row0=$(( _hist_fuzzy_row + wrap ))
 
   local n=${#_hist_fuzzy_shown}
   local idx=0
@@ -927,6 +956,13 @@ _hist_fuzzy_trigger() {
   if [[ $base != ${_hist_fuzzy_prev_key%|*} ]]; then
     _hist_fuzzy_dbg "CLRHOVER base=[$base] prev=[${_hist_fuzzy_prev_key%|*}]"
     _hist_fuzzy_hover=0
+    _hist_fuzzy_engaged=0                        # 换了输入，方向键/鼠标的"主动选择"状态作废
+  fi
+
+  # 原生补全（Tab / menu-select）激活时，列表一律让位：既不抢屏，也不干扰补全菜单。
+  # compstate 只有在补全进行中才存在，平时是未设置状态。
+  if (( ${+compstate} )) && [[ -n $compstate[context] ]]; then
+    return 0
   fi
 
   # 行内建议（zsh-autosuggestions 等）也写在 POSTDISPLAY 里。
@@ -988,6 +1024,11 @@ function _hist_fuzzy_complete_wrapper {
 }
 
 if [[ -o interactive ]] && zle -l >/dev/null 2>&1; then
+  # 先算提示符占几行：点选行号要折算成真正的输入行（见 _hist_fuzzy_query_row）。
+  # 展开 % 转义后数换行；空提示符按 1 行算。
+  local _pl=$(print -Pn -- "${PROMPT:-}" 2>/dev/null)
+  _hist_fuzzy_prompt_lines=$(( $(printf '%s' "$_pl" | tr -cd '\n' | wc -c) + 1 ))
+
   # ---- 与 compsys 共存：把这几个补全部件包一层（幂等）----------------------
   local _w
   for _w in expand-or-complete menu-complete menu-expand-or-complete \
@@ -1027,6 +1068,66 @@ if [[ -o interactive ]] && zle -l >/dev/null 2>&1; then
     bindkey -M emacs $'\x18m' hist-fuzzy-mouse-toggle 2>/dev/null
     bindkey -M viins $'\x18m' hist-fuzzy-mouse-toggle 2>/dev/null
   fi
+
+  # ---- 选中方式 4（WindTerm 风格）：方向键移动选择 + → / Ctrl-@ 接受 ----------
+  # 列表出现时，↑/↓ 在候选间移动高亮（可见的选中条），→ 或 Ctrl-@ 把高亮那条填进
+  # 命令行。列表不存在时，↑/↓/→ 原样放行给「原本绑定到这些键的部件」
+  # （历史浏览 / 光标右移 / zsh-autosuggestions 的 → 接受等），所以不干扰原生补全与 autosuggest。
+  # 为避免「只是敲字、还没动选择」时 → 误伤 autosuggest 的接受，只有用户主动用
+  # ↑/↓/鼠标移动过选择（_hist_fuzzy_engaged）后，→ 才接受我们的高亮项。
+  # 先记下同名键原本绑定的部件，fallback 时委托给它，避免抢原生行为。
+  local _ob
+  _ob=$(bindkey -M emacs $'\e[A' 2>/dev/null); _hist_fuzzy_orig[__up]=${_ob##* }
+  _ob=$(bindkey -M emacs $'\e[B' 2>/dev/null); _hist_fuzzy_orig[__down]=${_ob##* }
+  _ob=$(bindkey -M emacs $'\e[C' 2>/dev/null); _hist_fuzzy_orig[__right]=${_ob##* }
+  function hist-fuzzy-up {
+    if (( ${#_hist_fuzzy_shown} )); then
+      local _n
+      if (( _hist_fuzzy_hover > 1 )); then _n=$(( _hist_fuzzy_hover - 1 )); else _n=${#_hist_fuzzy_shown}; fi
+      _hist_fuzzy_engaged=1
+      _hist_fuzzy_hover_set $_n          # 内部会设 _hist_fuzzy_hover 并重画高亮
+      return 0
+    fi
+    zle ${_hist_fuzzy_orig[__up]:-up-line-or-history} 2>/dev/null || true
+    return 0
+  }
+  function hist-fuzzy-down {
+    if (( ${#_hist_fuzzy_shown} )); then
+      local _n
+      if (( _hist_fuzzy_hover < ${#_hist_fuzzy_shown} )); then _n=$(( _hist_fuzzy_hover + 1 )); else _n=1; fi
+      _hist_fuzzy_engaged=1
+      _hist_fuzzy_hover_set $_n
+      return 0
+    fi
+    zle ${_hist_fuzzy_orig[__down]:-down-line-or-history} 2>/dev/null || true
+    return 0
+  }
+  function hist-fuzzy-accept {
+    # 列表在、且用户主动选过 → 接受高亮项；否则委托给原本绑定到 → 的部件
+    # （通常是 forward-char 或 zsh-autosuggestions 的 autosuggest-accept），不抢原生行为。
+    if (( ${#_hist_fuzzy_shown} && _hist_fuzzy_engaged && _hist_fuzzy_hover )); then
+      BUFFER=${_hist_fuzzy_shown[_hist_fuzzy_hover]}
+      CURSOR=${#BUFFER}
+      _hist_fuzzy_hover=0; _hist_fuzzy_engaged=0
+      _hist_fuzzy_clear
+      _hist_fuzzy_shush
+      return 0
+    fi
+    zle ${_hist_fuzzy_orig[__right]:-forward-char} 2>/dev/null || true
+    return 0
+  }
+  zle -N hist-fuzzy-up
+  zle -N hist-fuzzy-down
+  zle -N hist-fuzzy-accept
+  for _m in emacs viins; do
+    bindkey -M $_m $'\e[A' hist-fuzzy-up     2>/dev/null   # ↑
+    bindkey -M $_m $'\e[B' hist-fuzzy-down   2>/dev/null   # ↓
+    bindkey -M $_m $'\e[C' hist-fuzzy-accept 2>/dev/null   # →
+  done
+  unset _m _ob
+  # Ctrl-@ 无论是否 engaged 都能接受当前高亮（多一个不抢原生键的快捷键）
+  bindkey -M emacs '^@' hist-fuzzy-accept 2>/dev/null
+  bindkey -M viins '^@' hist-fuzzy-accept 2>/dev/null
 
   # ---- 与 zsh-autosuggestions 共存 -------------------------------------------
   # 它默认异步（zpty 回调）直接改写 POSTDISPLAY 来显示行内灰字建议，那段回调
