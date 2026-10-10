@@ -52,7 +52,8 @@
 #   * 选中方式（WindTerm 风格，列表始终有一条高亮"选中"）：
 #     - ↑/↓ 在候选间移动高亮；→ 或 Ctrl-@ 把高亮那条填进命令行
 #       （只动过选择后 → 才接管理我们的项，没动过时 → 原样放行给光标/autosuggest）
-#     - Ctrl-X 1..9 直接填第 N 条（不依赖终端，最可靠）
+#     - 每行行首有 2 位序号(NN)，Alt+数字（或 Ctrl-X 数字）直接填第 N 条
+#       （Ctrl+数字被终端占作切标签、不可靠，故用 Alt；用 Ctrl-X 数字也行）
 #     - 鼠标：划过即反显高亮，点一下即填入（见 HIST_FUZZY_MOUSE，默认开）
 #     - Ctrl-X f 用 fzf 大面板（装了 fzf 才有）
 #   * 回车永远只执行「当前输入行」（R2），接受历史项请用上面的 ↑↓→ / Ctrl-X / 鼠标
@@ -94,7 +95,8 @@
 # ============================================================
 #  用法速查
 # ============================================================
-#  选中：↑/↓ 移动高亮，→ 或 Ctrl-@ 接受高亮项 | Ctrl-X 1..9（填第 N 条）| 鼠标点列表行 | Ctrl-X f（fzf 面板）
+#  选中：↑/↓ 移动高亮，→ 或 Ctrl-@ 接受高亮项 | 行首序号 + Alt+数字 / Ctrl-X 数字（填第 N 条）| 鼠标点列表行 | Ctrl-X f（fzf 面板）
+#  匹配高亮：列表里与你输入匹配的字符显示绿色，其余为默认色（HIST_FUZZY_COLOR_MATCH 可调）
 #  诊断：histf-diag [查询词]       现场取证：输入后按 Ctrl-X d 写 /tmp/histf_dump.txt
 #  可调（source 之前设置，改完 source 一遍即热更新）：
 #    HIST_FUZZY_MAX_HIST / MAX_SHOW / MIN_LEN / PLACE / MOUSE
@@ -105,8 +107,8 @@
 
 # ---------- 模块 A：加载控制 ----------
 # 用版本号而不是布尔量：改完文件再 source 能热替换，"source 了却没生效"的问题不再有
-(( ${_HIST_FUZZY_VERSION:-0} >= 10 )) && return 0
-typeset -g _HIST_FUZZY_VERSION=10
+(( ${_HIST_FUZZY_VERSION:-0} >= 11 )) && return 0
+typeset -g _HIST_FUZZY_VERSION=11
 
 # ---------- 参数 ----------
 : ${HIST_FUZZY_MAX_HIST:=10000}                   # 扫描最近多少条历史；实测全量(50000)
@@ -117,6 +119,7 @@ typeset -g _HIST_FUZZY_VERSION=10
 : ${HIST_FUZZY_COLOR_TOP:=fg=green,bold}
 : ${HIST_FUZZY_COLOR_REST:=fg=blue}
 : ${HIST_FUZZY_COLOR_FUZZY:=fg=black,bold}        # L4 子序列项：更暗，一眼能区分
+: ${HIST_FUZZY_COLOR_MATCH:=fg=green,bold}        # 列表里「命中的字符」叠成绿色（其余保持默认色）
 # 选中行(含鼠标悬停 / 方向键高亮)的高亮。用实打实的背景色，深底浅底都一眼可见；
 # 不要用 standout（有些终端反显太弱、或和已有颜色叠加后看不出来）。
 # 必须是 zsh 认得的规范写法（fg=xxx / bg=xxx / bold / standout ...）；
@@ -161,6 +164,7 @@ typeset -ga HIST_FUZZY_IGNORE
 typeset -ga _hist_fuzzy_cache                     # 历史缓存：最新在前，已去重
 typeset -ga _hist_fuzzy_result                    # 当前匹配结果
 typeset -ga _hist_fuzzy_hl                        # 本次添加的 region_highlight
+typeset -ga _hist_fuzzy_mpos                       # 某条命令里与查询匹配的字符位置（1-based）
 typeset -gA _hist_fuzzy_hl_ranges                 # 我们加进 region_highlight 的区间 "起:止"
 typeset -ga _hist_fuzzy_qpat                      # 查询拆成的单字符 pattern
 typeset -ga _hist_fuzzy_qchr                      # 查询拆成的单字符（原样）
@@ -622,6 +626,49 @@ _hist_fuzzy_clear() {
   _hist_fuzzy_hl=()
 }
 
+# 子序列匹配：找出命令里与查询 q 匹配的字符位置（1-based 数组 _hist_fuzzy_mpos）。
+# 用来把「命中的字符」叠成绿色，其余字符保持默认色（需求：匹配高亮绿色、其余默认）。
+# 大小写不敏感（与 build 的匹配口径一致）：比较时两边都转小写，记录原串位置。
+_hist_fuzzy_match_pos() {
+  local cand=$1 q=$2
+  _hist_fuzzy_mpos=()
+  (( ${#q} )) || return 0
+  local -a cc qa cl ql
+  cc=(${(s::)cand}); qa=(${(s::)q})
+  cl=(${(s::)${(L)cand}}); ql=(${(s::)${(L)q}})
+  local i j=1
+  for (( i=1; i<=${#cc}; i++ )); do
+    if (( j <= ${#qa} )) && [[ ${cl[i]} == ${ql[j]} ]]; then
+      _hist_fuzzy_mpos+=($i)
+      j=$(( j + 1 ))
+    fi
+  done
+  return 0
+}
+
+# 把命令里命中的字符（_hist_fuzzy_mpos，1-based）按连续段合并成若干 region_highlight
+# 绿色区间，追加进名为 $1 的数组（调用方的 hl）。参数：数组名 命令起点(1-based) 命令宽度 颜色。
+# 注：本机 zsh 不支持 local -n（nameref），用 eval + 动态作用域写回调用方的数组。
+_hist_fuzzy_add_match_hl() {
+  local _arr=$1 cmd0=$2 lw=$3 mcol=$4
+  local p run_start=-1 run_end=-1 prev=-2
+  for p in $_hist_fuzzy_mpos; do
+    (( p > lw )) && {
+      (( run_start >= 0 )) && eval "$_arr+=(\$(( $cmd0 + $run_start - 1 )) \$(( $cmd0 + $run_end )) \$mcol)"
+      run_start=-1; run_end=-1; prev=-2; continue
+    }
+    if (( p == prev + 1 )); then
+      run_end=$p
+    else
+      (( run_start >= 0 )) && eval "$_arr+=(\$(( $cmd0 + $run_start - 1 )) \$(( $cmd0 + $run_end )) \$mcol)"
+      run_start=$p; run_end=$p
+    fi
+    prev=$p
+  done
+  (( run_start >= 0 )) && eval "$_arr+=(\$(( $cmd0 + $run_start - 1 )) \$(( $cmd0 + $run_end )) \$mcol)"
+  return 0
+}
+
 _hist_fuzzy_render() {
   local -a cands
   cands=($_hist_fuzzy_result)
@@ -658,11 +705,12 @@ _hist_fuzzy_render() {
   fi
 
   local maxw=$(( ${COLUMNS:-80} - 1 ))
-  local line off i=0 col r
+  local line off i=0
   local txt=''
-  local -a hl=() parts
+  local -a hl=()
+  local mcol=${HIST_FUZZY_COLOR_MATCH:-fg=green,bold}
 
-  # 颜色：第 1 条高亮最佳匹配；L4 子序列项用暗色标示「凑数」
+  # 名次色：第 1 条最佳(绿)；L4 子序列「凑数」项(暗)；其余(蓝)；悬停(cyan)
   local -a cols=()
   for line in $cands; do
     i=$(( i + 1 ))
@@ -674,17 +722,29 @@ _hist_fuzzy_render() {
 
   _hist_fuzzy_dbg "RENDER n=${#cands} hover=$_hist_fuzzy_hover shown1=[${cands[1]}]"
   if [[ $HIST_FUZZY_PLACE == below ]]; then
-    # 向下：光标之后（列表在输入行下方）
-    # 第一段是别人的行内建议（紧跟光标），换行之后才是我们的列表
+    # 向下：列表在输入行下方。第一段是别人的行内建议，换行之后才是我们的列表
     txt=${_hist_fuzzy_prefix}$'\n'
     off=$(( ${#BUFFER} + ${#_hist_fuzzy_prefix} ))
     i=0
     for line in $cands; do
-      (( ${#line} > maxw )) && line="${line[1,maxw]}"
       i=$(( i + 1 ))
-      txt+=$line$'\n'
-      hl+=("$(( off + 1 )) $(( off + 1 + ${#line} )) ${cols[i]}")
-      off=$(( off + 1 + ${#line} ))
+      # 每行前面留 3 列给序号 "NN "(两位零填+空格)，命令宽度相应减 3
+      local lw=$(( maxw - 3 )); (( lw < 1 )) && lw=1
+      (( ${#line} > lw )) && line="${line[1,lw]}"
+      local istr=${(l:2::0:)i}                 # 序号：01..09 / 10..
+      local disp="$istr $line"
+      local cmd0=$(( off + 1 + 3 ))            # 命令文本在整行中的 1-based 起点（跳过 "NN "）
+      txt+=$disp$'\n'
+      # 选中行：先铺整行 cyan 背景（WindTerm 式选中条），后面再在命中字符上叠绿色
+      if (( i == _hist_fuzzy_hover )); then
+        hl+=("$(( off + 1 )) $(( off + 1 + ${#disp} )) $HIST_FUZZY_COLOR_HOVER")
+      fi
+      # 序号段("NN ")用名次色，让排名一眼可辨
+      hl+=("$(( off + 1 )) $(( off + 1 + 3 )) ${cols[i]}")
+      # 命中字符：把命令里与查询匹配的字符叠成绿色，其余保持默认色；合并连续段减少条目
+      _hist_fuzzy_match_pos "$line" "$LBUFFER"
+      _hist_fuzzy_add_match_hl hl "$cmd0" "$lw" "$mcol"
+      off=$(( off + 1 + ${#disp} ))
     done
     { POSTDISPLAY=$txt; } 2>/dev/null || return 1
   else
@@ -692,11 +752,20 @@ _hist_fuzzy_render() {
     off=0
     i=0
     for line in $cands; do
-      (( ${#line} > maxw )) && line="${line[1,maxw]}"
       i=$(( i + 1 ))
-      txt+=$line$'\n'
-      hl+=("$off $(( off + ${#line} )) ${cols[i]}")
-      off=$(( off + ${#line} + 1 ))
+      local lw=$(( maxw - 3 )); (( lw < 1 )) && lw=1
+      (( ${#line} > lw )) && line="${line[1,lw]}"
+      local istr=${(l:2::0:)i}
+      local disp="$istr $line"
+      local cmd0=$(( off + 3 ))
+      txt+=$disp$'\n'
+      if (( i == _hist_fuzzy_hover )); then
+        hl+=("$off $(( off + ${#disp} )) $HIST_FUZZY_COLOR_HOVER")
+      fi
+      hl+=("$off $(( off + 3 )) ${cols[i]}")
+      _hist_fuzzy_match_pos "$line" "$LBUFFER"
+      _hist_fuzzy_add_match_hl hl "$cmd0" "$lw" "$mcol"
+      off=$(( off + ${#disp} + 1 ))
     done
     { PREDISPLAY=$txt; } 2>/dev/null || return 1
   fi
@@ -1051,6 +1120,17 @@ if [[ -o interactive ]] && zle -l >/dev/null 2>&1; then
     bindkey -M viins "$_hist_fuzzy_cx$_i" hist-fuzzy-pick-$_i 2>/dev/null
   done
   unset _i _hist_fuzzy_cx
+
+  # ---- 选中方式 1b：Alt+数字 直接选第 N 条（行首的序号就是对应 id）------------
+  # 用 Alt(ESC)+数字 而非 Ctrl+数字：Ctrl+1..9 在绝大多数终端里被「切换标签页」
+  # 等占用、根本不会发给 shell，所以 Ctrl+数字不可靠；Alt+数字(ESC+数字)稳定可用。
+  # 复用上面的 hist-fuzzy-pick-N 部件。
+  local _d
+  for _d in 1 2 3 4 5 6 7 8 9; do
+    bindkey -M emacs "\e$_d" hist-fuzzy-pick-$_d 2>/dev/null
+    bindkey -M viins "\e$_d" hist-fuzzy-pick-$_d 2>/dev/null
+  done
+  unset _d
 
   # ---- 选中方式 2（可选）：装了 fzf 就支持鼠标点选/滚轮的大面板 --------------
   if (( ${+commands[fzf]} )) || [[ -e ${HOME}/.fzf.zsh ]]; then
