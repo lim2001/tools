@@ -1,0 +1,20 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://10.10.150.4:31080",
+    "ANTHROPIC_AUTH_TOKEN": "sk-_UiUZ4PLjHCSU7RV9j8aSA",
+
+    "ANTHROPIC_MODEL": "deepseek-v4-flash-0731-vl",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4-flash-0731-vl",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "deepseek-v4-flash-0731-vl",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-v4-flash-0731-vl",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "deepseek-v4-flash-0731-vl",
+    "ANTHROPIC_SMALL_FAST_MODEL": "deepseek-v4-flash-0731-vl",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-v4-flash-0731-vl",
+    "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": "deepseek-v4-flash-0731-vl",
+
+    "ANTHROPIC_BETAS": "context-1m-2025-08-07",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "420000",
+    "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  }
+}
