@@ -726,6 +726,18 @@ def mouse_closed(s):
         assert s.xterm.state['mouse']=='none'
 
 
+def mouse_filled(s, command, entries=None):
+    assert probe(s)==command and listed(s)
+    assert 1000 << 5 in s.screen.mode and 1006 << 5 in s.screen.mode
+    if s.xterm:
+        assert s.xterm.state['mouse']=='vt200'
+    if entries is not None:
+        assert [text for _,text in listed(s)]==[text for _,text in entries], 'click changed candidates/order'
+    assert int((s.home/'state').read_text().split()[0])==len(command)
+    for name in ('executed','directories','accepted-commands','accept-widget'):
+        assert not (s.home/name).exists(), 'click executed instead of filling: '+name
+
+
 def mouse_cd(s):
     rows=mouse_rows(s, 'cd disk')
     y=rows[8][0]+1
@@ -740,6 +752,21 @@ def mouse_cd(s):
     assert b'\x1b[2J' not in painted
     assert not (s.home/'accepted-commands').exists()
     s.mouse(y=y,release=True,delay=.3)
+    mouse_filled(s, 'cd disk/rk3588', rows)
+    s.snapshot('direct-click-filled-not-executed')
+    # A queued extra click cannot execute the newly filled input.
+    s.send(mouse_report(y=y)+mouse_report(y=y,release=True))
+    mouse_filled(s, 'cd disk/rk3588', rows)
+    # A mistaken first choice can be corrected using the original numbered menu.
+    for idx in (2,9):
+        current=listed(s)
+        row=current[idx-1][0]+1
+        s.mouse(y=row);s.mouse(y=row,release=True)
+        mouse_filled(s, rows[idx-1][1][3:], rows)
+        assert s.snapshot(f'reselected-{idx:02d}')['cyan_rows']==[row-1]
+        first_row=listed(s)[0][0]
+        assert all(s.screen.buffer[first_row][x].fg=='green' for x in range(3,10))
+    s.send(b'\r',.3)
     mouse_closed(s)
     assert (s.home/'directories').read_text()==str(s.home/'completion/disk/rk3588')+'\n'
     assert (s.home/'accepted-commands').read_text()=='cd disk/rk3588\n'
@@ -752,13 +779,14 @@ def mouse_cd(s):
     assert (s.home/'accepted-commands').read_text()=='cd disk/rk3588\n'
     s.snapshot('direct-click-executed')
     return {'automatic_mouse':True,'item_09_screen_row':y,'executed':'cd disk/rk3588',
-            'original_enter_calls':1,'terminal_replies':s.replies}
+            'click_only_filled':True,'clicks':[9,2,9],'candidates_kept':True,
+            'original_enter_calls_after_Enter':1,'terminal_replies':s.replies}
 
 for mode, cols, prior in (('vi',80,0),('emacs',100,6),('omz',80,40),('omz',100,0)):
     extra=CD_HISTORY
     if prior: extra+=f'for n in {{1..{prior}}}; do print -r -- prior-output; done\n'
-    run(f'mouse: automatic direct item 09, {mode}, {cols} columns, {prior} prior lines',mode,extra,mouse_cd,cols=cols)
-run('mouse: direct item 09 with multiline colored Chinese prompt','omz',CD_HISTORY+r'''
+    run(f'mouse: click fills item 09, Enter executes, {mode}, {cols} columns, {prior} prior lines',mode,extra,mouse_cd,cols=cols)
+run('mouse: click fills item 09 with multiline colored Chinese prompt','omz',CD_HISTORY+r'''
 PROMPT=$'%F{blue}中文提示符：第一行%f\n%F{green}第二行%f > '
 RPROMPT='%F{yellow}右侧%f'
 ''',mouse_cd,cols=80)
@@ -800,9 +828,11 @@ def mouse_resize(s):
     y=entries[2][0]+1
     expected=entries[2][1][3:].removeprefix('record ')
     s.mouse(y=y);s.mouse(y=y,release=True)
+    mouse_filled(s, 'record '+expected, entries)
+    s.send(b'\r')
     assert (s.home/'executed').read_text()==expected+'\n'
     mouse_closed(s)
-run('mouse: resizing cancels stale click and new coordinates still execute','omz','',mouse_resize)
+run('mouse: resizing cancels stale click and new coordinates still fill','omz','',mouse_resize)
 
 
 def mouse_invalid(s):
@@ -823,9 +853,11 @@ def mouse_invalid(s):
         assert probe(s)=='record MANUAL',repr(data)
     s.send('\x1b[<0;',.1);s.send(f'4;{y}M',.2)
     s.send('\x1b[<0;4;',.1);s.send(f'{y}m',.3)
+    mouse_filled(s, 'record MANUAL-07', rows)
+    s.send(b'\r')
     assert (s.home/'executed').read_text()=='MANUAL-07\n'
     mouse_closed(s)
-    return {'ignored_inputs':len(cases),'fragmented_click_executes_once':True}
+    return {'ignored_inputs':len(cases),'fragmented_click_fills_only':True,'Enter_executes_once':True}
 run('mouse: invalid/outside/modified/non-left events never execute or insert reports','omz','',mouse_invalid)
 
 
@@ -890,9 +922,11 @@ def mouse_unicode(s):
     assert len(rows)==1 and rows[0][1].endswith('…')
     y=rows[0][0]+1
     s.mouse(x=40,y=y);s.mouse(x=40,y=y,release=True)
+    mouse_filled(s, 'record 中文'+'宽'*100, rows)
+    s.send(b'\r')
     assert (s.home/'executed').read_text()=='中文'+'宽'*100+'\n'
     mouse_closed(s)
-run('mouse: clipped Unicode row executes full command','omz',"print -s -- 'record 中文"+'宽'*100+"'\n",mouse_unicode,cols=80)
+run('mouse: clipped Unicode row fills full command, then Enter executes','omz',"print -s -- 'record 中文"+'宽'*100+"'\n",mouse_unicode,cols=80)
 
 
 def mouse_wrapped(s):
@@ -908,6 +942,8 @@ def mouse_wrapped(s):
     after=s.snapshot('wrapped-middle-press')
     assert before['lines']==after['lines'] and before['cursor']==after['cursor']
     s.mouse(y=y,release=True)
+    mouse_filled(s, query+'-08', rows)
+    s.send(b'\r')
     assert (s.home/'executed').read_text()=='wide'*28+'-08\n'
     mouse_closed(s)
 run('mouse: wrapped input, wrapped gray suffix and cursor in middle','omz',
@@ -954,6 +990,71 @@ _hf_function_key() { print -r -- called > $HOME/function-key; }
 zle -N _hf_function_key
 bindkey -M main '\e[1;2R' _hf_function_key
 ''',mouse_function_key)
+
+
+def mouse_fill_then_edit(s):
+    entries=mouse_rows(s)
+    y=entries[8][0]+1
+    command=entries[8][1][3:]
+    s.mouse(y=y);s.mouse(y=y,release=True)
+    mouse_filled(s,command,entries)
+    s.send('-EDITED')
+    assert probe(s)==command+'-EDITED' and not (s.home/'executed').exists()
+    assert not listed(s), 'typing must leave the preserved menu and run a new search'
+    s.send(b'\r')
+    assert (s.home/'executed').read_text()==command.removeprefix('record ')+'-EDITED\n'
+run('mouse: filled command remains editable and Enter executes edited input','omz','',mouse_fill_then_edit)
+
+
+def mouse_fill_then_cancel(s):
+    entries=mouse_rows(s)
+    y=entries[8][0]+1
+    s.mouse(y=y);s.mouse(y=y,release=True)
+    mouse_filled(s,entries[8][1][3:],entries)
+    s.send(b'\x03')
+    assert probe(s)=='' and not (s.home/'executed').exists()
+    mouse_closed(s)
+run('mouse: Ctrl-C cancels filled command without executing','omz','',mouse_fill_then_cancel)
+
+
+def mouse_reselect_then_enter(s):
+    entries=mouse_rows(s)
+    for idx in (9,2):
+        y=listed(s)[idx-1][0]+1
+        s.mouse(y=y);s.mouse(y=y,release=True)
+        mouse_filled(s,entries[idx-1][1][3:],entries)
+    s.send(b'\r')
+    assert (s.home/'executed').read_text()==entries[1][1][3:].removeprefix('record ')+'\n'
+    mouse_closed(s)
+    assert probe(s)=='' and not listed(s)
+run('mouse: second choice replaces first, Enter executes only second choice','omz','',mouse_reselect_then_enter)
+
+
+def mouse_preserved_dismiss(s):
+    entries=mouse_rows(s)
+    y=entries[8][0]+1
+    s.mouse(y=y);s.mouse(y=y,release=True)
+    command=entries[8][1][3:]
+    mouse_filled(s,command,entries)
+    s.send(b'\x07')
+    mouse_closed(s)
+    assert probe(s)==command and not listed(s)
+    s.send(mouse_report(y=y)+mouse_report(y=y,release=True))
+    assert probe(s)==command and not (s.home/'executed').exists()
+    s.send(b'\r')
+    assert (s.home/'executed').read_text()==command.removeprefix('record ')+'\n'
+run('mouse: Ctrl-G explicitly closes preserved list and keeps filled command','omz','',mouse_preserved_dismiss)
+
+
+def mouse_preserved_keyboard(s):
+    entries=mouse_rows(s)
+    y=entries[8][0]+1
+    s.mouse(y=y);s.mouse(y=y,release=True)
+    mouse_filled(s,entries[8][1][3:],entries)
+    s.send(b'\x1b[A\r')
+    assert (s.home/'executed').read_text()==entries[7][1][3:].removeprefix('record ')+'\n'
+    mouse_closed(s)
+run('mouse: preserved menu still supports arrow selection and Enter','omz','',mouse_preserved_keyboard)
 
 report = {
     'plugin': PLUGIN,

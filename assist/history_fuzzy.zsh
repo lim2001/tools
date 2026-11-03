@@ -3,7 +3,7 @@
 # Tab/→ 默认保留输入行原有补全；先按 ↑/↓ 选择历史项后，Tab/→ 才填该项。
 # Alt-1..9 直接填历史项；Ctrl-G 收起；主动选择历史项后回车填入并执行该项，
 # 未主动选择或已返回输入行编辑时，回车只执行 BUFFER。
-# 列表出现后自动接收鼠标：左键单击历史项即可执行，不需要额外快捷键。
+# 左键单击只填入历史项，保留原候选和顺序供再次点选；按回车才执行。
 # Esc、viins、emacs、main、vicmd 的原生绑定均不改写。
 #
 # 下拉渲染用 ZLE 的 POSTDISPLAY 和 region_highlight；仅点击时查询首项位置，
@@ -19,12 +19,12 @@
 # 追加维度：_hist_fuzzy_dim_add name weight '代码；结果放 _hist_fuzzy_dim_val'
 
 [[ -o interactive && -o zle ]] || return 0
-(( ${_HIST_FUZZY_VERSION:-0} >= 17 )) && return 0
+(( ${_HIST_FUZZY_VERSION:-0} >= 19 )) && return 0
 if (( ${_HIST_FUZZY_VERSION:-0} > 0 && _HIST_FUZZY_VERSION < 13 )); then
   print -u2 -- 'history_fuzzy: 请新开 zsh 加载新版，以清除旧版覆盖的部件。'
   return 1
 fi
-typeset -g _HIST_FUZZY_VERSION=17
+typeset -g _HIST_FUZZY_VERSION=19
 zmodload zsh/parameter
 zmodload zsh/zleparameter
 zmodload zsh/zselect
@@ -319,6 +319,7 @@ typeset -g _hist_fuzzy_retired_suffix=''
 typeset -g _hist_fuzzy_mouse_enabled=0 _hist_fuzzy_mouse_pressed=0
 typeset -g _hist_fuzzy_mouse_buffer='' _hist_fuzzy_mouse_command=''
 typeset -g _hist_fuzzy_mouse_first=0 _hist_fuzzy_mouse_size=''
+typeset -g _hist_fuzzy_pinned=0 _hist_fuzzy_pinned_buffer=''
 typeset -g _hist_fuzzy_suppressed='' _hist_fuzzy_closed=0 _hist_fuzzy_hover=1
 typeset -g _hist_fuzzy_engaged=0 _hist_fuzzy_selection_cursor=0
 typeset -g _hist_fuzzy_busy=0 _hist_fuzzy_active=0
@@ -347,11 +348,13 @@ _hist_fuzzy_detach() {
 
 _hist_fuzzy_update() {
   emulate -L zsh
+  # 鼠标填入不改变查询及其高亮；用户修改文字后才重新搜索。
+  [[ $BUFFER == "$_hist_fuzzy_pinned_buffer" ]] || _hist_fuzzy_pinned=0
   if (( _hist_fuzzy_closed )); then
     [[ $BUFFER == "$_hist_fuzzy_suppressed" ]] && { _hist_fuzzy_shown=(); return 0; }
     _hist_fuzzy_closed=0
   fi
-  if [[ $BUFFER != "$_hist_fuzzy_query" ]]; then
+  if (( ! _hist_fuzzy_pinned )) && [[ $BUFFER != "$_hist_fuzzy_query" ]]; then
     _hist_fuzzy_query=$BUFFER
     _hist_fuzzy_build "$BUFFER"
     _hist_fuzzy_hover=1
@@ -421,6 +424,7 @@ _hist_fuzzy_compose() {
 }
 
 _hist_fuzzy_dismiss() {
+  _hist_fuzzy_pinned=0
   _hist_fuzzy_mouse_off
   _hist_fuzzy_detach
   _hist_fuzzy_closed=1
@@ -457,6 +461,7 @@ _hist_fuzzy_call() {
     if [[ $BUFFER != "$hf_before_buffer" ]] || (( CURSOR != hf_before_cursor )); then
       _hist_fuzzy_engaged=0
     fi
+    [[ $BUFFER == "$hf_before_buffer" ]] || _hist_fuzzy_pinned=0
     if (( completion )); then _hist_fuzzy_suppressed=$BUFFER; fi
     if [[ $KEYMAP == "$_hist_fuzzy_base" ]] && (( _hist_fuzzy_active )); then
       zle -K "${_hist_fuzzy_maps[$_hist_fuzzy_base]}"
@@ -636,7 +641,8 @@ _hist_fuzzy_mouse() {
     _hist_fuzzy_mouse_pressed=0
     (( hf_button == 0 && hf_x >= 1 && hf_x < COLUMNS && hf_y >= 1 && hf_y <= LINES )) || return 0
     (( _hist_fuzzy_mouse_enabled && _hist_fuzzy_active && ! _hist_fuzzy_closed && ${#_hist_fuzzy_shown} )) || return 0
-    [[ $BUFFER == "$_hist_fuzzy_query" && -n $_hist_fuzzy_suffix && $POSTDISPLAY == *"$_hist_fuzzy_suffix" ]] || return 0
+    [[ ( $BUFFER == "$_hist_fuzzy_query" || ( $_hist_fuzzy_pinned == 1 && $BUFFER == "$_hist_fuzzy_pinned_buffer" ) ) &&
+       -n $_hist_fuzzy_suffix && $POSTDISPLAY == *"$_hist_fuzzy_suffix" ]] || return 0
     (( BUFFERLINES <= LINES )) || return 0
     [[ $(command stty size <&$hf_fd 2>/dev/null) == "$hf_height $hf_width" ]] || return 0
     [[ $hf_kind == M ]] || (( hf_pressed )) || return 0
@@ -657,11 +663,13 @@ _hist_fuzzy_mouse() {
     elif (( hf_idx == hf_pressed && hf_first == _hist_fuzzy_mouse_first )) &&
          [[ $BUFFER == "$_hist_fuzzy_mouse_buffer" && $hf_command == "$_hist_fuzzy_mouse_command" &&
             $_hist_fuzzy_mouse_size == "$hf_height $hf_width" ]]; then
+      _hist_fuzzy_detach
       BUFFER=$hf_command
       CURSOR=${#BUFFER}
       POSTDISPLAY=''
-      _hist_fuzzy_dismiss
-      _hist_fuzzy_native_key $'\r'
+      _hist_fuzzy_pinned=1
+      _hist_fuzzy_pinned_buffer=$BUFFER
+      _hist_fuzzy_engaged=0
     fi
   } always {
     exec {hf_fd}>&-
@@ -711,6 +719,7 @@ _hist_fuzzy_make_map() {
 }
 
 _hist_fuzzy_init() {
+  _hist_fuzzy_pinned=0
   _hist_fuzzy_active=1
   _hist_fuzzy_suffix=''
   _hist_fuzzy_retired_suffix=''
@@ -731,6 +740,7 @@ _hist_fuzzy_select() {
       [[ -n ${_hist_fuzzy_maps[$KEYMAP]-} ]] || _hist_fuzzy_make_map "$KEYMAP"
       zle -K "${_hist_fuzzy_maps[$KEYMAP]}" ;;
     vicmd)
+      _hist_fuzzy_pinned=0
       _hist_fuzzy_mouse_off
       _hist_fuzzy_detach
       _hist_fuzzy_shown=()
@@ -745,6 +755,7 @@ _hist_fuzzy_select() {
 }
 
 _hist_fuzzy_finish() {
+  _hist_fuzzy_pinned=0
   _hist_fuzzy_mouse_off
   _hist_fuzzy_active=0
   _hist_fuzzy_detach
@@ -770,6 +781,7 @@ _hist_fuzzy_suggest_highlight() {
 }
 
 _hist_fuzzy_precmd() {
+  _hist_fuzzy_pinned=0
   _hist_fuzzy_mouse_off
   # SIGINT 跳过 line-finish；ZLE 已把光标放在列表末尾的下一行。
   # 仅在这条退出路径按已知列表行数相对上移并清除，完全不查询绝对光标位置。
