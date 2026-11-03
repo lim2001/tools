@@ -1,9 +1,10 @@
 #!/usr/bin/env zsh
-# 历史实时下拉：输入行下方最多 10 条（HIST_FUZZY_MAX_SHOW 可设为 15）。
-# 输入模式下 ↑/↓ 只控制列表；空输入时首次按键打开最近历史并选中第一项。
+# 历史实时下拉：输入行下方最多 10 条（HIST_FUZZY_MAX_SHOW 可调小）。
+# ↑/↓ 连续滚动列表、不循环，并实时填入高亮命令；原查询保持到用户编辑为止。
+# 空输入时首次按方向键打开最近历史并填入第一项。
 # PageUp/PageDown 逐条调取较旧/较新的原生历史到输入行。
 # Tab/→ 默认保留输入行原有补全；先按 ↑/↓ 选择历史项后，Tab/→ 才填该项。
-# Alt-1..9 直接填历史项；Ctrl-G 收起；主动选择历史项后回车填入并执行该项，
+# Alt-1..9 填当前窗口第 N 行；Ctrl-G 收起；主动选择后回车执行该项，
 # 未主动选择或已返回输入行编辑时，回车只执行 BUFFER。
 # 左键单击只填入历史项，保留原候选和顺序供再次点选；按回车才执行。
 # Esc、viins、emacs、main、vicmd 的原生绑定均不改写。
@@ -21,7 +22,7 @@
 # 追加维度：_hist_fuzzy_dim_add name weight '代码；结果放 _hist_fuzzy_dim_val'
 
 [[ -o interactive && -o zle ]] || return 0
-(( ${_HIST_FUZZY_VERSION:-0} >= 21 )) && return 0
+(( ${_HIST_FUZZY_VERSION:-0} >= 22 )) && return 0
 if (( ${_HIST_FUZZY_VERSION:-0} > 0 && _HIST_FUZZY_VERSION < 13 )); then
   print -u2 -- 'history_fuzzy: 请新开 zsh 加载新版，以清除旧版覆盖的部件。'
   return 1
@@ -30,7 +31,7 @@ fi
 if (( ${_HIST_FUZZY_VERSION:-0} > 0 && _HIST_FUZZY_VERSION < 20 )) && [[ $HIST_FUZZY_COLOR_HOVER == bg=cyan,fg=black ]]; then
   HIST_FUZZY_COLOR_HOVER=bg=23,fg=255
 fi
-typeset -g _HIST_FUZZY_VERSION=21
+typeset -g _HIST_FUZZY_VERSION=22
 zmodload zsh/parameter
 zmodload zsh/zleparameter
 zmodload zsh/zselect
@@ -260,7 +261,7 @@ _hist_fuzzy_build() {
   setopt extendedglob
   local q=$1 cand name pat text word score
   local -i level budget idx count=0
-  local -a exact prefix boundary substr abbrev multi fuzzy group ranked
+  local -a exact prefix boundary substr abbrev multi fuzzy group ranked tail
   local -A seen
   _hist_fuzzy_result=()
   _hist_fuzzy_qchr=() _hist_fuzzy_qpat=() _hist_fuzzy_toks=() _hist_fuzzy_hits=()
@@ -268,7 +269,7 @@ _hist_fuzzy_build() {
   # 空输入由方向键显式打开最近历史；沿用缓存的去重和过滤，保持时间顺序。
   if [[ -z $q ]]; then
     if (( _hist_fuzzy_recent && HIST_FUZZY_MAX_SHOW > 0 && ${#_hist_fuzzy_cache} )); then
-      _hist_fuzzy_result=("${(@)_hist_fuzzy_cache[1,HIST_FUZZY_MAX_SHOW]}")
+      _hist_fuzzy_result=("${_hist_fuzzy_cache[@]}")
     fi
     return 0
   fi
@@ -304,15 +305,25 @@ _hist_fuzzy_build() {
       5) group=("${multi[@]}") ;;
       6)
         (( ${#q} >= HIST_FUZZY_FUZZY_MIN_LEN && HIST_FUZZY_FUZZY_MAX > 0 )) || continue
-        group=("${(@M)_hist_fuzzy_cache:#${~pat}}") ;;
+        group=()
+        for cand in "${_hist_fuzzy_cache[@]}"; do
+          [[ -n ${seen[$cand]-} ]] && continue
+          [[ $cand == ${~pat} ]] && group+=("$cand")
+        done ;;
     esac
     budget=$HIST_FUZZY_SCORE_LIMIT
     (( level >= 4 || ${#q} <= 2 )) && budget=$HIST_FUZZY_LOOSE_LIMIT
-    ranked=()
+    ranked=() tail=()
     idx=0
     for cand in "${group[@]}"; do
       [[ -n ${seen[$cand]-} ]] && continue
-      (( ++idx > budget )) && break
+      # 只精排最近的一批，其余同级匹配按时间顺序保留，供继续滚动。
+      # 松散子序列仍遵守原有 FUZZY_MAX / SPAN_SLACK 限制。
+      if (( ++idx > budget )); then
+        (( level == 6 )) && break
+        tail+=("$cand")
+        continue
+      fi
       _hist_fuzzy_score "$cand" || continue
       (( level == 6 && _hist_fuzzy_span > ${#q} + HIST_FUZZY_SPAN_SLACK )) && continue
       score=$_hist_fuzzy_sc
@@ -324,9 +335,13 @@ _hist_fuzzy_build() {
       cand=${text#* }
       seen[$cand]=1
       _hist_fuzzy_result+=("$cand")
-      (( ${#_hist_fuzzy_result} >= HIST_FUZZY_MAX_SHOW )) && return 0
       (( level == 6 && ++count >= HIST_FUZZY_FUZZY_MAX )) && break
     done
+    for cand in "${tail[@]}"; do
+      seen[$cand]=1
+      _hist_fuzzy_result+=("$cand")
+    done
+    (( ${#_hist_fuzzy_result} == ${#_hist_fuzzy_cache} )) && return 0
   done
   return 0
 }
@@ -339,6 +354,7 @@ typeset -g _hist_fuzzy_mouse_first=0 _hist_fuzzy_mouse_size=''
 typeset -g _hist_fuzzy_pinned=0 _hist_fuzzy_pinned_buffer=''
 typeset -g _hist_fuzzy_recent=0
 typeset -g _hist_fuzzy_suppressed='' _hist_fuzzy_closed=0 _hist_fuzzy_hover=1
+typeset -g _hist_fuzzy_top=1
 typeset -g _hist_fuzzy_engaged=0 _hist_fuzzy_selection_cursor=0
 typeset -g _hist_fuzzy_busy=0 _hist_fuzzy_active=0
 typeset -ga _hist_fuzzy_shown=()
@@ -368,7 +384,7 @@ _hist_fuzzy_update() {
   emulate -L zsh
   # 翻页键调取历史时，建议插件的中间重绘也保持列表收起。
   (( ${_hist_fuzzy_history_browsing:-0} )) && { _hist_fuzzy_shown=(); return 0; }
-  # 鼠标填入不改变查询及其高亮；用户修改文字后才重新搜索。
+  # 方向键和鼠标填入不改变查询及其高亮；用户修改文字后才重新搜索。
   [[ $BUFFER == "$_hist_fuzzy_pinned_buffer" ]] || _hist_fuzzy_pinned=0
   if (( _hist_fuzzy_recent && ! _hist_fuzzy_pinned )) && [[ -n $BUFFER ]]; then
     _hist_fuzzy_recent=0
@@ -382,6 +398,7 @@ _hist_fuzzy_update() {
     _hist_fuzzy_query=$BUFFER
     _hist_fuzzy_build "$BUFFER"
     _hist_fuzzy_hover=1
+    _hist_fuzzy_top=1
     _hist_fuzzy_engaged=0
   fi
   # 光标回到输入行编辑后，Tab/→ 恢复原生含义；探针/重绘不改变选择。
@@ -392,9 +409,17 @@ _hist_fuzzy_update() {
   for part in "${(@f)${:-"$BUFFER$POSTDISPLAY"}}"; do
     (( n -= ${(m)#part} / (COLUMNS > 0 ? COLUMNS : 80) + 1 ))
   done
+  (( n > HIST_FUZZY_MAX_SHOW )) && n=$HIST_FUZZY_MAX_SHOW
+  (( n > 10 )) && n=10
+  (( n > ${#_hist_fuzzy_result} )) && n=${#_hist_fuzzy_result}
   if (( n < 1 || COLUMNS < 8 )); then _hist_fuzzy_shown=(); return 0; fi
-  _hist_fuzzy_shown=("${(@)_hist_fuzzy_result[1,n]}")
-  (( _hist_fuzzy_hover > ${#_hist_fuzzy_shown} )) && _hist_fuzzy_hover=1
+  (( _hist_fuzzy_hover > ${#_hist_fuzzy_result} )) && _hist_fuzzy_hover=${#_hist_fuzzy_result}
+  (( _hist_fuzzy_hover < 1 )) && _hist_fuzzy_hover=1
+  (( _hist_fuzzy_top > ${#_hist_fuzzy_result} - n + 1 )) && _hist_fuzzy_top=$(( ${#_hist_fuzzy_result} - n + 1 ))
+  (( _hist_fuzzy_top < 1 )) && _hist_fuzzy_top=1
+  (( _hist_fuzzy_hover < _hist_fuzzy_top )) && _hist_fuzzy_top=$_hist_fuzzy_hover
+  (( _hist_fuzzy_hover >= _hist_fuzzy_top + n )) && _hist_fuzzy_top=$(( _hist_fuzzy_hover - n + 1 ))
+  _hist_fuzzy_shown=("${(@)_hist_fuzzy_result[_hist_fuzzy_top,_hist_fuzzy_top+n-1]}")
   return 0
 }
 
@@ -410,37 +435,42 @@ _hist_fuzzy_compose() {
   (( PENDING || KEYS_QUEUED_COUNT )) && return 0
   _hist_fuzzy_update
   (( ${#_hist_fuzzy_shown} )) || { _hist_fuzzy_mouse_off; return 0; }
-  local line row colour
+  local line row colour number
   # 旧版 ZLE 遇到重复 fg 会停止解析；先移除选中行前景，再设置匹配字颜色。
   local -a hover_match_base=("${(@s:,:)HIST_FUZZY_COLOR_HOVER}")
   [[ ,$HIST_FUZZY_COLOR_HOVER_MATCH, == *,fg=*,* ]] &&
     hover_match_base=("${(@)hover_match_base:#fg=*}")
   local hover_match="${(j:,:)hover_match_base},$HIST_FUZZY_COLOR_HOVER_MATCH"
-  local -i i=0 off pos limit=$(( COLUMNS - 1 )) start=${#region_highlight} run end
+  local -i i=0 index off pos limit=$(( COLUMNS - 1 )) start=${#region_highlight} run end digits prefix
+  number=$(( _hist_fuzzy_top + ${#_hist_fuzzy_shown} - 1 ))
+  digits=${#number}
+  (( digits < 2 )) && digits=2
+  prefix=$(( digits + 1 ))
   # 保留输入和建议的折行空间；很小的终端直接少画几条。
   (( limit >= 8 )) || return 0
   for line in "${_hist_fuzzy_shown[@]}"; do
     (( ++i ))
+    index=$(( _hist_fuzzy_top + i - 1 ))
     # (m) 按屏幕单元格裁剪和填充；不展开历史中的 %、$() 等文本。
-    if (( ${(m)#line} > limit - 3 )); then
-      line="${(mr:$((limit - 4)):)line}…"
+    if (( ${(m)#line} > limit - prefix )); then
+      line="${(mr:$((limit - prefix - 1)):)line}…"
     fi
-    row="${(l:2::0:)i} $line"
+    row="${(l:digits::0:)index} $line"
     row=${(mr:limit:)row}
     off=$(( ${#BUFFER} + ${#POSTDISPLAY} + ${#_hist_fuzzy_suffix} + 1 ))
     _hist_fuzzy_suffix+=$'\n'$row
     colour=fg=default,bg=default
-    (( i == _hist_fuzzy_hover )) && colour=$HIST_FUZZY_COLOR_HOVER
+    (( index == _hist_fuzzy_hover )) && colour=$HIST_FUZZY_COLOR_HOVER
     # 5.8 会把 memo 当成最后一个样式值的一部分；逗号先结束该值。
     region_highlight+=("$off $((off + ${#row})) $colour, memo=history-fuzzy")
     _hist_fuzzy_hits=()
     (( ${#_hist_fuzzy_qchr} )) && _hist_fuzzy_score "$_hist_fuzzy_shown[i]"
     colour=$HIST_FUZZY_COLOR_MATCH
-    (( i == _hist_fuzzy_hover )) && colour=$hover_match
+    (( index == _hist_fuzzy_hover )) && colour=$hover_match
     run=0 end=0
     for pos in "${_hist_fuzzy_hits[@]}" 0; do
       if (( pos != end + 1 || pos > ${#line} )); then
-        (( run )) && region_highlight+=("$((off + 2 + run)) $((off + 3 + end)) $colour, memo=history-fuzzy")
+        (( run )) && region_highlight+=("$((off + prefix - 1 + run)) $((off + prefix + end)) $colour, memo=history-fuzzy")
         run=0
       fi
       (( !pos || pos > ${#line} )) && break
@@ -530,21 +560,26 @@ _hist_fuzzy_key() {
      { [[ $action != tab && $action != right && $action != enter ]] || (( _hist_fuzzy_engaged )); }; then
     case $action in
       up|down)
+        if (( ! opening )); then
+          if [[ $action == up ]]; then
+            (( _hist_fuzzy_hover > 1 )) && (( --_hist_fuzzy_hover ))
+          else
+            (( _hist_fuzzy_hover < ${#_hist_fuzzy_result} )) && (( ++_hist_fuzzy_hover ))
+          fi
+        fi
+        BUFFER=$_hist_fuzzy_result[_hist_fuzzy_hover]
+        CURSOR=${#BUFFER}
+        POSTDISPLAY=''
+        _hist_fuzzy_pinned=1
+        _hist_fuzzy_pinned_buffer=$BUFFER
         _hist_fuzzy_engaged=1
-        _hist_fuzzy_selection_cursor=$CURSOR
-        # 首次空输入打开时选第一项；此后方向键只移动列表高亮。
-        (( opening )) && return 0
-        if [[ $action == up ]]; then
-          (( _hist_fuzzy_hover = (_hist_fuzzy_hover + ${#_hist_fuzzy_shown} - 2) % ${#_hist_fuzzy_shown} + 1 ))
-        else
-          (( _hist_fuzzy_hover = _hist_fuzzy_hover % ${#_hist_fuzzy_shown} + 1 ))
-        fi ;;
+        _hist_fuzzy_selection_cursor=$CURSOR ;;
       cancel) _hist_fuzzy_dismiss ;;
       tab|right|enter|pick-*)
         idx=$_hist_fuzzy_hover
-        [[ $action == pick-* ]] && idx=${action#pick-}
-        if (( idx <= ${#_hist_fuzzy_shown} )); then
-          BUFFER=$_hist_fuzzy_shown[idx]
+        [[ $action == pick-* ]] && idx=$(( _hist_fuzzy_top + ${action#pick-} - 1 ))
+        if (( idx >= _hist_fuzzy_top && idx < _hist_fuzzy_top + ${#_hist_fuzzy_shown} )); then
+          BUFFER=$_hist_fuzzy_result[idx]
           CURSOR=${#BUFFER}
           POSTDISPLAY=''
           _hist_fuzzy_dismiss
@@ -721,7 +756,7 @@ _hist_fuzzy_mouse() {
       _hist_fuzzy_mouse_command=$hf_command
       _hist_fuzzy_mouse_first=$hf_first
       _hist_fuzzy_mouse_size="$hf_height $hf_width"
-      _hist_fuzzy_hover=$hf_idx
+      _hist_fuzzy_hover=$(( _hist_fuzzy_top + hf_idx - 1 ))
       _hist_fuzzy_engaged=0
     elif (( hf_idx == hf_pressed && hf_first == _hist_fuzzy_mouse_first )) &&
          [[ $BUFFER == "$_hist_fuzzy_mouse_buffer" && $hf_command == "$_hist_fuzzy_mouse_command" &&
