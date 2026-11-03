@@ -3,11 +3,17 @@
 
 Run: python3 assist/tests/history_fuzzy_pty.py
 Optional: --omz /path/to/oh-my-zsh --plugin /path/to/history_fuzzy.zsh
+Use --mouse-only for automatic mouse cases, --focused for native keys/Enter.
 Each child uses an empty environment, a fresh HOME and a private plugin copy.
-Only synthetic history is loaded. The PTY and pyte share dimensions and never
-reply to DSR. Raw terminal bytes, screen snapshots and results are kept in /tmp.
+Only synthetic history is loaded. The PTY and terminal emulator share dimensions.
+CPR replies come from the emulator's cursor, with separate no-response cases.
+For xterm-generated clicks, pass --xterm-headless /path/to/@xterm/headless.
+Raw terminal bytes, screen snapshots and results are kept in /tmp.
 """
 import argparse
+import base64
+import subprocess
+from types import SimpleNamespace
 import errno
 import fcntl
 import hashlib
@@ -32,6 +38,8 @@ import pyte
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--plugin', type=Path, default=Path(__file__).resolve().parents[1] / 'history_fuzzy.zsh')
 parser.add_argument('--omz', type=Path, default=Path.home() / '.oh-my-zsh')
+parser.add_argument('--mouse-only', action='store_true', help='only automatic mouse regressions')
+parser.add_argument('--xterm-headless', type=Path, help='optional installed @xterm/headless directory')
 parser.add_argument('--focused', action='store_true', help='only native key and Enter selection regressions')
 args = parser.parse_args()
 PLUGIN = str(args.plugin.resolve())
@@ -41,16 +49,79 @@ if not Path(OMZ, 'oh-my-zsh.sh').is_file():
 ARTIFACTS = Path(tempfile.mkdtemp(prefix='history-fuzzy-pty-'))
 print('Evidence: ' + str(ARTIFACTS), flush=True)
 
+class TerminalScreen(pyte.Screen):
+    def report_device_status(self, mode, **kwargs):
+        if mode == 6 and kwargs.get('private'):
+            self.write_process_input(f'\x1b[?{self.cursor.y+1};{self.cursor.x+1}R')
+        else:
+            super().report_device_status(mode)
+
+
+class Xterm:
+    def __init__(self, cols, rows):
+        self.proc = subprocess.Popen(['node', str(Path(__file__).with_name('history_fuzzy_xterm.cjs')),
+                                      str(args.xterm_headless.resolve())],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.state = self.call(op='init', cols=cols, rows=rows)
+
+    def call(self, **request):
+        self.proc.stdin.write(json.dumps(request)+'\n')
+        self.proc.stdin.flush()
+        result=json.loads(self.proc.stdout.readline())
+        assert 'error' not in result,result
+        self.state=result
+        return result
+
+    def close(self):
+        self.proc.stdin.close()
+        self.proc.wait(timeout=3)
+
+
+class XtermScreen:
+    # Use xterm's own screen and colors as the source of truth: its resize/reflow
+    # behavior differs from pyte, so combining one engine's mouse rows with the
+    # other's display would produce misleading acceptance results.
+    palette = ('black','red','green','brown','blue','magenta','cyan','white',
+               'brightblack','brightred','brightgreen','brightbrown',
+               'brightblue','brightmagenta','brightcyan','brightwhite')
+    blank = pyte.Screen(1,1).default_char
+
+    def update(self, state):
+        self.display = state['lines']
+        self.cursor = SimpleNamespace(y=state['cursor'][0], x=state['cursor'][1], hidden=state['hidden'])
+        self.mode = set()
+        if state['mouse'] != 'none': self.mode.add(1000 << 5)
+        if state['encoding'] == 'SGR': self.mode.add(1006 << 5)
+        def color(n):
+            return 'default' if n < 0 else self.palette[n] if n < 16 else str(n)
+        self.buffer = {y: {x: self.blank._replace(data=c[0],fg=color(c[1]),bg=color(c[2]))
+                           for x,c in enumerate(row)} for y,row in enumerate(state['cells'])}
+
+    def resize(self, rows, cols):
+        pass  # The bridge resizes the actual terminal and returns the resulting screen.
+
+
 class Session:
-    def __init__(self, rc, cols=100, rows=24, plugin=None):
+    def __init__(self, rc, cols=100, rows=24, plugin=None, cpr=True):
         self.home = Path(tempfile.mkdtemp(prefix="case-", dir=ARTIFACTS))
-        (self.home / ".zshrc").write_text(rc)
+        (self.home / ".zshrc").write_text(rc + r"""
+# Wait for ZLE, not a fixed startup delay: Ctrl-C must never interrupt .zshrc.
+for map in main viins vicmd; do bindkey -L -M $map > $HOME/$map.before; done
+autoload -Uz add-zle-hook-widget
+_hf_test_ready() { : > $HOME/ready; }
+add-zle-hook-widget line-init _hf_test_ready
+""")
         if plugin:
             shutil.copyfile(plugin, self.home / 'history_fuzzy.zsh')
         self.cols, self.rows = cols, rows
-        self.screen = pyte.Screen(cols, rows)
+        self.screen = TerminalScreen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
         self.raw = bytearray()
+        self.xterm = Xterm(cols, rows) if args.xterm_headless else None
+        self.cpr = cpr
+        if self.xterm:
+            self.screen = XtermScreen()
+            self.screen.update(self.xterm.state)
         pid, fd = pty.fork()
         if pid == 0:
             fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
@@ -59,7 +130,20 @@ class Session:
                    "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "SHELL": "/usr/bin/zsh"}
             os.execve("/usr/bin/zsh", ["zsh", "-d", "-i"], env)
         self.pid, self.fd = pid, fd
-        self.read(1)
+        self.replies = []
+        if cpr and not self.xterm:
+            self.screen.write_process_input = self.reply
+        deadline = time.monotonic() + 10
+        while not (self.home/'ready').exists():
+            self.read(.05)
+            if time.monotonic() > deadline:
+                self.close()
+                raise AssertionError('shell did not finish initializing')
+        self.read(.1)
+
+    def reply(self, data):
+        self.replies.append(data)
+        os.write(self.fd, data.encode())
 
     def read(self, duration=.2):
         start = len(self.raw)
@@ -75,11 +159,29 @@ class Session:
                 if not data:
                     break
                 self.raw.extend(data)
-                self.stream.feed(data)  # No DSR replies are ever sent.
+                if not self.xterm:
+                    self.stream.feed(data)
+                if self.xterm:
+                    state=self.xterm.call(op='write',data=base64.b64encode(data).decode())
+                    self.screen.update(state)
+                    for reply in state['data']:
+                        if self.cpr:
+                            self.reply(reply)
         return bytes(self.raw[start:])
 
     def send(self, data, delay=.2):
         os.write(self.fd, data.encode() if isinstance(data, str) else data)
+        return self.read(delay)
+
+    def mouse(self, button=0, x=4, y=1, release=False, delay=.2):
+        if self.xterm:
+            state=self.xterm.call(op='mouse',button=button,x=x,y=y,release=release)
+            assert state['sent'] and state['data'], 'terminal did not forward the physical click'
+            for data in state['data']:
+                os.write(self.fd, data.encode())
+        else:
+            assert 1000 << 5 in self.screen.mode and 1006 << 5 in self.screen.mode
+            os.write(self.fd, f"\x1b[<{button};{x};{y}{'m' if release else 'M'}".encode())
         return self.read(delay)
 
     def snapshot(self, label):
@@ -93,6 +195,8 @@ class Session:
     def resize(self, cols, rows):
         self.cols, self.rows = cols, rows
         self.screen.resize(rows, cols)
+        if self.xterm:
+            self.screen.update(self.xterm.call(op='resize',cols=cols,rows=rows))
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         os.kill(self.pid, signal.SIGWINCH)
         self.read(.3)
@@ -102,6 +206,8 @@ class Session:
         os.kill(self.pid, signal.SIGTERM)
         os.close(self.fd)
         os.waitpid(self.pid, 0)
+        if self.xterm:
+            self.xterm.close()
 
 
 
@@ -166,7 +272,7 @@ def probe(s):
     deadline=time.monotonic()+3
     while time.monotonic()<deadline:
         if target.exists() and target.stat().st_mtime_ns>previous:
-            s.read(.02)
+            s.read(.15)
             return target.read_text().removesuffix('\n')
         s.read(.005)
     raise AssertionError('probe timed out')
@@ -194,7 +300,7 @@ def exercise(mode, cols):
     s = Session(config(mode), cols=cols, plugin=PLUGIN)
     checks = []
     try:
-        assert not re.search(rb'(command not found|read-only|bad pattern|parse error|maximum nested)', s.raw), bytes(s.raw)
+        assert not re.search(rb'(command not found|read-only|bad pattern|parse error|maximum nested|incompatible keymap)', s.raw), bytes(s.raw)
         s.send('record MANUAL')
         assert probe(s) == 'record MANUAL'
         state = (s.home/'state').read_text().split()
@@ -297,8 +403,8 @@ def exercise(mode, cols):
         assert probe(s).startswith('record MANUAL-')
         assert (s.home/'executed').read_text() == executed
         checks.append('burst input + arrow + Tab uses current query')
-        assert b'\x1b[6n' not in s.raw
-        assert not re.search(rb'(command not found|read-only|bad pattern|parse error|maximum nested)', s.raw)
+        assert b'\x1b[6n' not in s.raw and b'\x1b[?6n' not in s.raw
+        assert not re.search(rb'(command not found|read-only|bad pattern|parse error|maximum nested|incompatible keymap)', s.raw)
         checks.append('no DSR, errors, or stray list text in BUFFER')
         return {'mode': mode, 'size': [cols,24], 'pass': True, 'checks': checks, 'artifacts': str(s.home)}
     except Exception as e:
@@ -310,20 +416,22 @@ def exercise(mode, cols):
 
 
 matrix=[]
-for mode in (() if args.focused else ('vi','emacs','omz')):
+for mode in (() if args.focused or args.mouse_only else ('vi','emacs','omz')):
     for cols in (80,100):
         result=exercise(mode,cols)
         matrix.append(result)
         print(('PASS' if result['pass'] else 'FAIL') + f' {mode} {cols}x24', flush=True)
 
 edge_results=[]
-def run(name, mode, extra, test, cols=100, rows=24):
+def run(name, mode, extra, test, cols=100, rows=24, cpr=True):
+    if args.mouse_only and not name.startswith('mouse:'):
+        return
     if args.focused and not name.startswith(('native keys:', 'Enter selection:')):
         return
-    s=Session(config(mode,extra), cols=cols, rows=rows, plugin=PLUGIN)
+    s=Session(config(mode,extra), cols=cols, rows=rows, plugin=PLUGIN, cpr=cpr)
     try:
         detail=test(s)
-        assert not re.search(rb'(command not found|read-only|bad pattern|parse error|maximum nested)', s.raw)
+        assert not re.search(rb'(command not found|read-only|bad pattern|parse error|maximum nested|incompatible keymap)', s.raw)
         edge_results.append(dict(name=name,passed=True,detail=detail,artifacts=str(s.home)))
     except Exception:
         s.snapshot('FAILED')
@@ -595,8 +703,261 @@ run('Enter selection: default and dismissed/edited choices execute only typed in
     'omz','',enter_without_selection)
 
 
+def mouse_report(button=0, x=4, y=11, release=False):
+    return f'\x1b[<{button};{x};{y}' + ('m' if release else 'M')
+
+
+def mouse_rows(s, query='record MANUAL'):
+    clean(s, query)
+    rows=listed(s)
+    assert rows and 1000 << 5 in s.screen.mode and 1006 << 5 in s.screen.mode
+    assert b'\x1b[?1049h' not in s.raw, 'must use the existing dropdown, no separate panel'
+    if s.xterm:
+        actual=[(y,line.rstrip()) for y,line in enumerate(s.xterm.state['lines']) if re.match(r'^\d\d ',line)]
+        assert actual==rows,(actual,rows)
+        assert s.xterm.state['mouse']=='vt200'
+    return rows
+
+
+def mouse_closed(s):
+    assert 1000 << 5 not in s.screen.mode and 1006 << 5 not in s.screen.mode
+    assert not s.screen.cursor.hidden
+    if s.xterm:
+        assert s.xterm.state['mouse']=='none'
+
+
+def mouse_cd(s):
+    rows=mouse_rows(s, 'cd disk')
+    y=rows[8][0]+1
+    assert rows[8][1]=='09 cd disk/rk3588'
+    before=s.snapshot('direct-click-before')
+    caret=before['cursor']
+    painted=s.mouse(y=y)
+    press=s.snapshot('direct-click-press')
+    assert press['cyan_rows']==[y-1],press
+    assert all(s.screen.buffer[y-1][x].bg=='cyan' for x in range(s.cols-1))
+    assert press['lines']==before['lines'] and press['cursor']==caret, 'click moved text or input cursor'
+    assert b'\x1b[2J' not in painted
+    assert not (s.home/'accepted-commands').exists()
+    s.mouse(y=y,release=True,delay=.3)
+    mouse_closed(s)
+    assert (s.home/'directories').read_text()==str(s.home/'completion/disk/rk3588')+'\n'
+    assert (s.home/'accepted-commands').read_text()=='cd disk/rk3588\n'
+    assert (s.home/'accept-widget').read_text()=='cd disk/rk3588\n'
+    assert probe(s)=='' and not listed(s)
+    for keymap in ('main','viins','vicmd'):
+        assert (s.home/f'{keymap}.before').read_bytes()==(s.home/f'{keymap}.after').read_bytes()
+    s.send(mouse_report(y=y)+mouse_report(y=y,release=True))
+    assert probe(s)==''
+    assert (s.home/'accepted-commands').read_text()=='cd disk/rk3588\n'
+    s.snapshot('direct-click-executed')
+    return {'automatic_mouse':True,'item_09_screen_row':y,'executed':'cd disk/rk3588',
+            'original_enter_calls':1,'terminal_replies':s.replies}
+
+for mode, cols, prior in (('vi',80,0),('emacs',100,6),('omz',80,40),('omz',100,0)):
+    extra=CD_HISTORY
+    if prior: extra+=f'for n in {{1..{prior}}}; do print -r -- prior-output; done\n'
+    run(f'mouse: automatic direct item 09, {mode}, {cols} columns, {prior} prior lines',mode,extra,mouse_cd,cols=cols)
+run('mouse: direct item 09 with multiline colored Chinese prompt','omz',CD_HISTORY+r'''
+PROMPT=$'%F{blue}中文提示符：第一行%f\n%F{green}第二行%f > '
+RPROMPT='%F{yellow}右侧%f'
+''',mouse_cd,cols=80)
+
+
+def mouse_cancel(s):
+    for key in (b'\x07',b'\x03'):
+        rows=mouse_rows(s)
+        y=rows[8][0]+1
+        s.mouse(y=y)
+        s.send(key)
+        mouse_closed(s)
+        s.send(mouse_report(y=y,release=True))
+        assert probe(s)==('' if key==b'\x03' else 'record MANUAL')
+        assert not (s.home/'executed').exists()
+    rows=mouse_rows(s)
+    s.mouse(y=rows[8][0]+1)
+    s.send(b'\x1b',.3)
+    mouse_closed(s)
+    s.send('i')
+    assert probe(s)=='record MANUAL'
+    assert listed(s)
+    s.snapshot('direct-click-cancelled')
+run('mouse: Ctrl-G/Ctrl-C/Esc release mouse and preserve vi editing','omz','',mouse_cancel)
+
+
+def mouse_resize(s):
+    for cols,rows in ((80,24),(40,12),(100,24)):
+        entries=mouse_rows(s)
+        y=entries[min(8,len(entries)-1)][0]+1
+        s.mouse(y=y)
+        s.resize(cols,rows)
+        s.send(mouse_report(y=y,release=True))
+        assert probe(s)=='record MANUAL'
+        assert (s.home/'state').read_text().split()[-2:]==[str(cols),str(rows)]
+        assert not (s.home/'executed').exists()
+        assert len(s.snapshot(f'auto-resize-{cols}-{rows}')['cyan_rows'])==1
+    entries=listed(s)
+    y=entries[2][0]+1
+    expected=entries[2][1][3:].removeprefix('record ')
+    s.mouse(y=y);s.mouse(y=y,release=True)
+    assert (s.home/'executed').read_text()==expected+'\n'
+    mouse_closed(s)
+run('mouse: resizing cancels stale click and new coordinates still execute','omz','',mouse_resize)
+
+
+def mouse_invalid(s):
+    rows=mouse_rows(s)
+    y=rows[8][0]+1
+    cases=[mouse_report(y=y,release=True),
+           mouse_report(y=y)+mouse_report(y=y-1,release=True)+mouse_report(y=y,release=True),
+           mouse_report(y=rows[0][0])+mouse_report(y=rows[0][0],release=True),
+           mouse_report(y=24)+mouse_report(y=24,release=True),
+           mouse_report(x=0,y=y)+mouse_report(x=0,y=y,release=True)]
+    for button in (1,2,4,8,16,32,64,65):
+        cases.append(mouse_report(button,y=y)+mouse_report(button,y=y,release=True))
+    cases += [f'\x1b[<999999999999999999999;4;{y}M'+mouse_report(y=y,release=True),
+              '\x1b[<0;4;garbageM'+mouse_report(y=y,release=True)]
+    for data in cases:
+        s.send(data,.15)
+        assert not (s.home/'executed').exists(),repr(data)
+        assert probe(s)=='record MANUAL',repr(data)
+    s.send('\x1b[<0;',.1);s.send(f'4;{y}M',.2)
+    s.send('\x1b[<0;4;',.1);s.send(f'{y}m',.3)
+    assert (s.home/'executed').read_text()=='MANUAL-07\n'
+    mouse_closed(s)
+    return {'ignored_inputs':len(cases),'fragmented_click_executes_once':True}
+run('mouse: invalid/outside/modified/non-left events never execute or insert reports','omz','',mouse_invalid)
+
+
+def mouse_edit(s):
+    for edit in (b'X\x7f',b'\x1b[B',b'\x1b[D\x1b[C'):
+        rows=mouse_rows(s)
+        y=rows[8][0]+1
+        s.mouse(y=y)
+        s.send(edit+mouse_report(y=y,release=True).encode())
+        assert not (s.home/'executed').exists()
+        assert probe(s)=='record MANUAL'
+    rows=mouse_rows(s)
+    y=rows[8][0]+1
+    s.mouse(y=y)
+    payload=mouse_report(y=y)+mouse_report(y=y,release=True)
+    s.send('\x1b[200~'+payload+'\x1b[201~',.3)
+    assert not (s.home/'executed').exists()
+    s.send(b'\x03')
+    mouse_closed(s)
+run('mouse: edit/cursor/arrow and bracketed paste cancel held click','omz','',mouse_edit)
+
+
+def mouse_native(s):
+    query='record PRIORITY'
+    for key in (b'\t',b'\x1b[C',b'\x1bOC'):
+        mouse_rows(s,query)
+        queries=s.raw.count(b'\x1b[?6n')
+        s.send(key)
+        assert probe(s)==query+'-most-recent-long'
+        assert s.raw.count(b'\x1b[?6n')==queries, 'typing queried cursor position'
+        rows=mouse_rows(s,query)
+        y=rows[1][0]+1
+        s.mouse(y=y)
+        s.send(key)
+        assert probe(s)==query+'-most-recent-long'
+        s.send(mouse_report(y=y,release=True))
+        assert not (s.home/'executed').exists()
+run('mouse: automatic capture leaves gray Tab and right untouched','omz',NATIVE_HISTORY+NATIVE_TAB,mouse_native)
+
+
+def mouse_completion(s):
+    mouse_rows(s,'cat al')
+    s.send(b'\t\t',.3)
+    mouse_closed(s)
+    assert probe(s)=='cat alp'
+    visible='\n'.join(s.screen.display)
+    assert 'alpha' in visible and 'alpine' in visible
+    s.snapshot('auto-mouse-native-completion')
+run('mouse: native completion releases capture automatically','omz',NATIVE_HISTORY,mouse_completion)
+
+
+def mouse_empty(s):
+    s.send('nonexistent-history-command')
+    mouse_closed(s)
+    assert probe(s)=='nonexistent-history-command'
+    assert b'\x1b[?1000h' not in s.raw and b'\x1b[?6n' not in s.raw
+run('mouse: empty history never captures mouse or queries position','vi','fc -p $HOME/empty 0\n',mouse_empty)
+
+
+def mouse_unicode(s):
+    rows=mouse_rows(s,'record 中文')
+    assert len(rows)==1 and rows[0][1].endswith('…')
+    y=rows[0][0]+1
+    s.mouse(x=40,y=y);s.mouse(x=40,y=y,release=True)
+    assert (s.home/'executed').read_text()=='中文'+'宽'*100+'\n'
+    mouse_closed(s)
+run('mouse: clipped Unicode row executes full command','omz',"print -s -- 'record 中文"+'宽'*100+"'\n",mouse_unicode,cols=80)
+
+
+def mouse_wrapped(s):
+    query='record '+'wide'*28
+    clean(s,query)
+    assert probe(s)==query
+    rows=listed(s)
+    y=rows[2][0]+1
+    s.send(b'\x1b[D'*60,.1)
+    assert probe(s)==query
+    before=s.snapshot('wrapped-middle-before')
+    s.mouse(y=y)
+    after=s.snapshot('wrapped-middle-press')
+    assert before['lines']==after['lines'] and before['cursor']==after['cursor']
+    s.mouse(y=y,release=True)
+    assert (s.home/'executed').read_text()=='wide'*28+'-08\n'
+    mouse_closed(s)
+run('mouse: wrapped input, wrapped gray suffix and cursor in middle','omz',
+    "for n in {01..10}; do print -s -- 'record "+'wide'*28+"-'$n; done\n",mouse_wrapped,cols=80)
+
+
+def mouse_no_response(s):
+    rows=mouse_rows(s)
+    y=rows[8][0]+1
+    start=time.monotonic()
+    s.mouse(y=y,delay=.6)
+    assert time.monotonic()-start<1
+    s.mouse(y=y,release=True)
+    assert not (s.home/'executed').exists()
+    assert probe(s)=='record MANUAL'
+    s.send('\x1b[?2;1R')  # A late private report is consumed, never inserted.
+    assert probe(s)=='record MANUAL'
+    # Keyboard input while waiting is replayed in order.
+    s.mouse(y=y,delay=.02)
+    s.send('X\x7f',.6)
+    assert probe(s)=='record MANUAL'
+    s.mouse(y=y,delay=.02)
+    s.send(b'\x1b',.6)
+    mouse_closed(s)
+    s.send('\x1b[?2;1R'+mouse_report(y=y,release=True))
+    s.send('i')
+    assert probe(s)=='record MANUAL'
+    s.send(b'\x07')
+    mouse_closed(s)
+    s.send(b'\r')
+    assert (s.home/'executed').read_text()=='MANUAL\n'
+run('mouse: no terminal position reply never guesses, leaks text or swallows keys','omz','',mouse_no_response,cpr=False)
+
+
+
+def mouse_function_key(s):
+    mouse_rows(s)
+    s.send(b'\x1b[1;2R')
+    assert (s.home/'function-key').read_text()=='called\n'
+    assert probe(s)=='record MANUAL'
+    assert not s.replies
+run('mouse: private cursor replies do not override Shift-F3', 'omz', r'''
+_hf_function_key() { print -r -- called > $HOME/function-key; }
+zle -N _hf_function_key
+bindkey -M main '\e[1;2R' _hf_function_key
+''',mouse_function_key)
+
 report = {
     'plugin': PLUGIN,
+    'terminal': str(args.xterm_headless) if args.xterm_headless else 'pyte with CPR replies',
     'sha256': hashlib.sha256(Path(PLUGIN).read_bytes()).hexdigest(),
     'matrix': matrix,
     'edges': edge_results,

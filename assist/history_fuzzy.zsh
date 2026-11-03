@@ -3,9 +3,10 @@
 # Tab/→ 默认保留输入行原有补全；先按 ↑/↓ 选择历史项后，Tab/→ 才填该项。
 # Alt-1..9 直接填历史项；Ctrl-G 收起；主动选择历史项后回车填入并执行该项，
 # 未主动选择或已返回输入行编辑时，回车只执行 BUFFER。
+# 列表出现后自动接收鼠标：左键单击历史项即可执行，不需要额外快捷键。
 # Esc、viins、emacs、main、vicmd 的原生绑定均不改写。
 #
-# 渲染只用 ZLE 的 POSTDISPLAY 和 region_highlight：不查询光标、
+# 下拉渲染用 ZLE 的 POSTDISPLAY 和 region_highlight；仅点击时查询首项位置，
 # 不改 PROMPT/PREDISPLAY、不排入伪按键。ZLE 负责折行、清除和差分重绘。
 # Ctrl-C 绕过 ZLE 结束钩子时，下一提示符前按已知列表行数相对清除残留。
 # POSTDISPLAY 的列表后缀在委托原生部件前摘除，灰字建议仍由原插件管理。
@@ -18,14 +19,16 @@
 # 追加维度：_hist_fuzzy_dim_add name weight '代码；结果放 _hist_fuzzy_dim_val'
 
 [[ -o interactive && -o zle ]] || return 0
-(( ${_HIST_FUZZY_VERSION:-0} >= 15 )) && return 0
+(( ${_HIST_FUZZY_VERSION:-0} >= 17 )) && return 0
 if (( ${_HIST_FUZZY_VERSION:-0} > 0 && _HIST_FUZZY_VERSION < 13 )); then
   print -u2 -- 'history_fuzzy: 请新开 zsh 加载新版，以清除旧版覆盖的部件。'
   return 1
 fi
-typeset -g _HIST_FUZZY_VERSION=15
+typeset -g _HIST_FUZZY_VERSION=17
 zmodload zsh/parameter
 zmodload zsh/zleparameter
+zmodload zsh/zselect
+zmodload zsh/datetime
 autoload -Uz add-zle-hook-widget add-zsh-hook
 
 : ${HIST_FUZZY_MAX_HIST:=10000}
@@ -313,6 +316,9 @@ _hist_fuzzy_build() {
 
 typeset -g _hist_fuzzy_suffix='' _hist_fuzzy_query=$'\0' _hist_fuzzy_base=main
 typeset -g _hist_fuzzy_retired_suffix=''
+typeset -g _hist_fuzzy_mouse_enabled=0 _hist_fuzzy_mouse_pressed=0
+typeset -g _hist_fuzzy_mouse_buffer='' _hist_fuzzy_mouse_command=''
+typeset -g _hist_fuzzy_mouse_first=0 _hist_fuzzy_mouse_size=''
 typeset -g _hist_fuzzy_suppressed='' _hist_fuzzy_closed=0 _hist_fuzzy_hover=1
 typeset -g _hist_fuzzy_engaged=0 _hist_fuzzy_selection_cursor=0
 typeset -g _hist_fuzzy_busy=0 _hist_fuzzy_active=0
@@ -367,7 +373,7 @@ _hist_fuzzy_update() {
 
 _hist_fuzzy_draw() {
   (( _hist_fuzzy_busy || ! _hist_fuzzy_active )) && return 0
-  [[ $KEYMAP == hf-map-* ]] || return 0
+  [[ $KEYMAP == hf-map-* && $_hist_fuzzy_base != vicmd ]] || return 0
   _hist_fuzzy_compose
 }
 
@@ -376,7 +382,7 @@ _hist_fuzzy_compose() {
   _hist_fuzzy_detach
   (( PENDING || KEYS_QUEUED_COUNT )) && return 0
   _hist_fuzzy_update
-  (( ${#_hist_fuzzy_shown} )) || return 0
+  (( ${#_hist_fuzzy_shown} )) || { _hist_fuzzy_mouse_off; return 0; }
   local line row colour
   local -i i=0 off pos limit=$(( COLUMNS - 1 )) start=${#region_highlight} run end
   # 保留输入和建议的折行空间；很小的终端直接少画几条。
@@ -410,10 +416,12 @@ _hist_fuzzy_compose() {
   done
   POSTDISPLAY+=$_hist_fuzzy_suffix
   _hist_fuzzy_highlights=("${(@)region_highlight[start+1,-1]}")
+  _hist_fuzzy_mouse_on
   return 0
 }
 
 _hist_fuzzy_dismiss() {
+  _hist_fuzzy_mouse_off
   _hist_fuzzy_detach
   _hist_fuzzy_closed=1
   _hist_fuzzy_suppressed=$BUFFER
@@ -429,6 +437,7 @@ _hist_fuzzy_dispatch() {
 }
 
 _hist_fuzzy_call() {
+  _hist_fuzzy_mouse_pressed=0
   local original=$1 ret=0 hf_before_buffer=$BUFFER hf_before_cursor=$CURSOR
   shift
   local -i completion=0
@@ -453,14 +462,15 @@ _hist_fuzzy_call() {
       zle -K "${_hist_fuzzy_maps[$_hist_fuzzy_base]}"
     fi
     _hist_fuzzy_busy=0
+    _hist_fuzzy_select
   }
   return $ret
 }
 
 _hist_fuzzy_key() {
+  _hist_fuzzy_mouse_pressed=0
   emulate -L zsh
-  local action=${WIDGET#hist-fuzzy-} binding original
-  local -a words
+  local action=${WIDGET#hist-fuzzy-}
   local -i idx
   _hist_fuzzy_detach
   _hist_fuzzy_update
@@ -491,7 +501,14 @@ _hist_fuzzy_key() {
     [[ $action == enter ]] || return 0
   fi
   # 未主动选择（即使有列表）也按当前原生绑定执行，包括用户自定义的灰字接受键。
-  binding=$(bindkey -L -M "$_hist_fuzzy_base" "$KEYS")
+  _hist_fuzzy_native_key "$KEYS" "$@"
+}
+
+_hist_fuzzy_native_key() {
+  local key=$1 binding original
+  local -a words
+  shift
+  binding=$(bindkey -L -M "$_hist_fuzzy_base" "$key")
   words=("${(@z)binding}")
   if (( ${words[(Ie)-s]} )); then
     zle -U -- "${(g:ce:)${(Q)words[-1]}}"
@@ -501,10 +518,161 @@ _hist_fuzzy_key() {
   _hist_fuzzy_call "$original" "$@"
 }
 
+# 下拉出现即接管鼠标；收起、补全、vicmd、执行和 Ctrl-C 后释放。
+_hist_fuzzy_mouse_on() {
+  (( _hist_fuzzy_mouse_enabled )) && return 0
+  [[ -n ${terminfo[cup]} ]] || return 0
+  print -rn -- $'\e[?1000h\e[?1006h' > /dev/tty
+  _hist_fuzzy_mouse_enabled=1
+}
+
+_hist_fuzzy_mouse_off() {
+  _hist_fuzzy_mouse_pressed=0
+  (( _hist_fuzzy_mouse_enabled )) || return 0
+  print -rn -- $'\e[?1000l\e[?1006l' > /dev/tty
+  _hist_fuzzy_mouse_enabled=0
+}
+
+_hist_fuzzy_mouse_read() {
+  (( PENDING || KEYS_QUEUED_COUNT )) || zselect -t 2 -r $hf_fd || return 1
+  IFS= read -rk1 hf_char
+}
+
+# 读取 CSI 前缀之后的参数，不将终端回报当作输入文字；也消费迟到的回报。
+_hist_fuzzy_mouse_packet() {
+  local -F deadline=$(( EPOCHREALTIME + 0.3 ))
+  local -i hf_valid=1
+  hf_packet=''
+  while (( EPOCHREALTIME < deadline && ${#hf_packet} < 32 )); do
+    _hist_fuzzy_mouse_read || continue
+    if [[ $hf_char == [0-9\;] ]]; then
+      hf_packet+=$hf_char
+    elif [[ $1 == *"$hf_char"* ]]; then
+      hf_packet+=$hf_char
+      (( hf_valid ))
+      return
+    elif [[ $hf_char == [[:print:]] ]]; then
+      hf_valid=0
+    else
+      zle -U -- "$hf_char"
+      return 1
+    fi
+  done
+  return 1
+}
+
+_hist_fuzzy_cursor_report() {
+  emulate -L zsh
+  local hf_fd hf_char hf_packet
+  exec {hf_fd}</dev/tty || return 0
+  { _hist_fuzzy_mouse_packet R } always { exec {hf_fd}<&- }
+  return 0
+}
+
+# 用 ZLE 自己的布局定位首项，兼容多行提示符、折行、中文和灰字。
+# 临时把完全相同的显示文本交给 BUFFER，仅移动隐藏的光标；请求发出后立即
+# 恢复原 BUFFER/CURSOR/POSTDISPLAY，再等待回报。绝不运行接受/编辑部件。
+# DEC 私有 CPR (?6n) 不与 F3 / Ctrl-方向键冲突；无回报时不猜行号执行。
+_hist_fuzzy_mouse_origin() {
+  local hf_saved_buffer=$BUFFER hf_saved_post=$POSTDISPLAY hf_saved_cursor=$CURSOR
+  local -a hf_saved_highlights=("${region_highlight[@]}")
+  local hf_input='' hf_replay='' hf_busy=$_hist_fuzzy_busy
+  local MATCH
+  local -i MBEGIN MEND
+  local -a match mbegin mend
+  local -F deadline=$(( EPOCHREALTIME + 0.4 ))
+  hf_first=0
+  _hist_fuzzy_busy=1
+  {
+    print -rn -u $hf_fd -- $'\e[?25l'
+    BUFFER+=$POSTDISPLAY
+    POSTDISPLAY=''
+    CURSOR=$(( ${#hf_saved_buffer} + ${#hf_saved_post} - ${#_hist_fuzzy_suffix} + 1 ))
+    zle -R
+    print -rn -u $hf_fd -- $'\e[?6n'
+  } always {
+    BUFFER=$hf_saved_buffer POSTDISPLAY=$hf_saved_post CURSOR=$hf_saved_cursor
+    region_highlight=("${hf_saved_highlights[@]}")
+    zle -R
+    print -rn -u $hf_fd -- $'\e[?25h'
+    _hist_fuzzy_busy=$hf_busy
+  }
+  while (( EPOCHREALTIME < deadline && ${#hf_input} < 1024 )); do
+    _hist_fuzzy_mouse_read || continue
+    hf_input+=$hf_char
+    if [[ $hf_input =~ $'\e''\[\?([0-9]{1,5});([0-9]{1,5})(;[0-9]{1,5})?R' ]]; then
+      hf_first=$((10#$match[1]))
+      # 首项的光标必须处于第 1 列，且整个列表确实能放入当前屏幕。
+      (( 10#$match[2] == 1 && hf_first > 0 && hf_first + ${#_hist_fuzzy_shown} - 1 <= LINES )) || hf_first=0
+      (( MBEGIN > 1 )) && hf_replay=${hf_input[1,MBEGIN-1]}
+      (( MEND < ${#hf_input} )) && hf_replay+=${hf_input[MEND+1,-1]}
+      [[ -n $hf_replay ]] && zle -U -- "$hf_replay"
+      if [[ $BUFFER != "$hf_saved_buffer" || $POSTDISPLAY != "$hf_saved_post" ]] || (( CURSOR != hf_saved_cursor )); then
+        hf_first=0
+      fi
+      return 0
+    fi
+  done
+  # 等待期间的用户按键/鼠标释放回到 ZLE，不能吞键或填入报告正文。
+  [[ -n $hf_input ]] && zle -U -- "$hf_input"
+  return 1
+}
+
+_hist_fuzzy_mouse() {
+  emulate -L zsh
+  local hf_fd hf_char hf_packet hf_command
+  local -i hf_button hf_x hf_y hf_idx hf_first=0 hf_pressed=$_hist_fuzzy_mouse_pressed
+  local -i hf_width=$COLUMNS hf_height=$LINES
+  local -a match mbegin mend
+  local MATCH
+  exec {hf_fd}<>/dev/tty || return 0
+  _hist_fuzzy_mouse_pressed=0
+  {
+    _hist_fuzzy_mouse_packet Mm || return 0
+    [[ $hf_packet =~ '^([0-9]{1,3});([0-9]{1,5});([0-9]{1,5})([Mm])$' ]] || return 0
+    hf_button=$((10#$match[1])) hf_x=$((10#$match[2])) hf_y=$((10#$match[3]))
+    hf_char=$match[4]
+    local hf_kind=$hf_char
+    _hist_fuzzy_mouse_pressed=0
+    (( hf_button == 0 && hf_x >= 1 && hf_x < COLUMNS && hf_y >= 1 && hf_y <= LINES )) || return 0
+    (( _hist_fuzzy_mouse_enabled && _hist_fuzzy_active && ! _hist_fuzzy_closed && ${#_hist_fuzzy_shown} )) || return 0
+    [[ $BUFFER == "$_hist_fuzzy_query" && -n $_hist_fuzzy_suffix && $POSTDISPLAY == *"$_hist_fuzzy_suffix" ]] || return 0
+    (( BUFFERLINES <= LINES )) || return 0
+    [[ $(command stty size <&$hf_fd 2>/dev/null) == "$hf_height $hf_width" ]] || return 0
+    [[ $hf_kind == M ]] || (( hf_pressed )) || return 0
+    _hist_fuzzy_mouse_origin || return 0
+    (( hf_first && COLUMNS == hf_width && LINES == hf_height )) || return 0
+    [[ $(command stty size <&$hf_fd 2>/dev/null) == "$hf_height $hf_width" ]] || return 0
+    hf_idx=$(( hf_y - hf_first + 1 ))
+    (( hf_idx >= 1 && hf_idx <= ${#_hist_fuzzy_shown} )) || return 0
+    hf_command=$_hist_fuzzy_shown[hf_idx]
+    if [[ $hf_kind == M ]]; then
+      _hist_fuzzy_mouse_pressed=$hf_idx
+      _hist_fuzzy_mouse_buffer=$BUFFER
+      _hist_fuzzy_mouse_command=$hf_command
+      _hist_fuzzy_mouse_first=$hf_first
+      _hist_fuzzy_mouse_size="$hf_height $hf_width"
+      _hist_fuzzy_hover=$hf_idx
+      _hist_fuzzy_engaged=0
+    elif (( hf_idx == hf_pressed && hf_first == _hist_fuzzy_mouse_first )) &&
+         [[ $BUFFER == "$_hist_fuzzy_mouse_buffer" && $hf_command == "$_hist_fuzzy_mouse_command" &&
+            $_hist_fuzzy_mouse_size == "$hf_height $hf_width" ]]; then
+      BUFFER=$hf_command
+      CURSOR=${#BUFFER}
+      POSTDISPLAY=''
+      _hist_fuzzy_dismiss
+      _hist_fuzzy_native_key $'\r'
+    fi
+  } always {
+    exec {hf_fd}>&-
+  }
+  return 0
+}
+
 # 只复制键表，不覆盖用户的 main / viins / emacs / vicmd，也不改 Esc。
 _hist_fuzzy_make_map() {
   emulate -L zsh
-  local base=$1 map=hf-map-$1 entry original key
+  local base=$1 map=hf-map-$1 entry original key binding
   local -a words
   bindkey -N "$map" "$base"
   for entry in "${(@f)$(bindkey -L -M "$base")}"; do
@@ -516,11 +684,19 @@ _hist_fuzzy_make_map() {
     [[ $original == undefined-key ]] && continue
     zle -N "hf-call:$original" _hist_fuzzy_dispatch
     words[-1]=hf-call:$original
-    # bindkey -L 省略 main 的 -M；其他键表则显式带上。
+    # bindkey -L 对 main 省略 -M，对 vicmd 使用 -a。
+    words=("${(@)words:#-a}")
     if (( ${words[(Ie)-M]} )); then words[${words[(Ie)-M]}+1]=$map
     else words=(bindkey -M "$map" "${(@)words[2,-1]}"); fi
     "${words[@]}"
   done
+  # vicmd 也用副本消费迟到的终端回报；所有编辑键继续委托原生部件。
+  if [[ $base == vicmd ]]; then
+    bindkey -M "$map" '\e[<' hist-fuzzy-mouse
+    bindkey -M "$map" '\e[?' hist-fuzzy-cursor-report
+    _hist_fuzzy_maps[$base]=$map
+    return 0
+  fi
   for key in $'\e[A' $'\eOA'; do bindkey -M "$map" "$key" hist-fuzzy-up; done
   for key in $'\e[B' $'\eOB'; do bindkey -M "$map" "$key" hist-fuzzy-down; done
   for key in $'\e[C' $'\eOC'; do bindkey -M "$map" "$key" hist-fuzzy-right; done
@@ -529,6 +705,8 @@ _hist_fuzzy_make_map() {
   bindkey -M "$map" '^J' hist-fuzzy-enter
   bindkey -M "$map" '^G' hist-fuzzy-cancel
   for key in {1..9}; do bindkey -M "$map" "\e$key" hist-fuzzy-pick-$key; done
+  bindkey -M "$map" '\e[<' hist-fuzzy-mouse
+  bindkey -M "$map" '\e[?' hist-fuzzy-cursor-report
   _hist_fuzzy_maps[$base]=$map
 }
 
@@ -552,13 +730,22 @@ _hist_fuzzy_select() {
       _hist_fuzzy_base=$KEYMAP
       [[ -n ${_hist_fuzzy_maps[$KEYMAP]-} ]] || _hist_fuzzy_make_map "$KEYMAP"
       zle -K "${_hist_fuzzy_maps[$KEYMAP]}" ;;
+    vicmd)
+      _hist_fuzzy_mouse_off
+      _hist_fuzzy_detach
+      _hist_fuzzy_shown=()
+      _hist_fuzzy_engaged=0
+      _hist_fuzzy_base=vicmd
+      [[ -n ${_hist_fuzzy_maps[vicmd]-} ]] || _hist_fuzzy_make_map vicmd
+      zle -K "${_hist_fuzzy_maps[vicmd]}" ;;
     hf-map-*) ;;
-    *) _hist_fuzzy_detach; _hist_fuzzy_shown=(); _hist_fuzzy_engaged=0 ;;
+    *) _hist_fuzzy_mouse_off; _hist_fuzzy_detach; _hist_fuzzy_shown=(); _hist_fuzzy_engaged=0 ;;
   esac
   return 0
 }
 
 _hist_fuzzy_finish() {
+  _hist_fuzzy_mouse_off
   _hist_fuzzy_active=0
   _hist_fuzzy_detach
   _hist_fuzzy_shown=()
@@ -571,18 +758,19 @@ _hist_fuzzy_finish() {
 _hist_fuzzy_suggest_highlight() {
   # Esc 的原生 autosuggest 包装器可能恢复进入 vicmd 前保存的 POSTDISPLAY。
   # 清理这份旧后缀；Esc 本身仍保持原绑定。
-  if [[ $KEYMAP != hf-map-* && $KEYMAP != "$_hist_fuzzy_base" &&
+  if [[ ( $_hist_fuzzy_base == vicmd || ( $KEYMAP != hf-map-* && $KEYMAP != "$_hist_fuzzy_base" ) ) &&
         -n $_hist_fuzzy_retired_suffix && $POSTDISPLAY == *"$_hist_fuzzy_retired_suffix" ]]; then
     POSTDISPLAY=${POSTDISPLAY%"$_hist_fuzzy_retired_suffix"}
   fi
   _hist_fuzzy_original_suggest_highlight "$@"
-  if (( _hist_fuzzy_active && _hist_fuzzy_busy != 1 )) && [[ $KEYMAP == hf-map-* || $KEYMAP == "$_hist_fuzzy_base" ]]; then
+  if (( _hist_fuzzy_active && _hist_fuzzy_busy != 1 )) && [[ $_hist_fuzzy_base != vicmd && ( $KEYMAP == hf-map-* || $KEYMAP == "$_hist_fuzzy_base" ) ]]; then
     _hist_fuzzy_compose
   fi
   return 0
 }
 
 _hist_fuzzy_precmd() {
+  _hist_fuzzy_mouse_off
   # SIGINT 跳过 line-finish；ZLE 已把光标放在列表末尾的下一行。
   # 仅在这条退出路径按已知列表行数相对上移并清除，完全不查询绝对光标位置。
   if (( _hist_fuzzy_active && ${#_hist_fuzzy_shown} )) && [[ -n $_hist_fuzzy_suffix ]]; then
@@ -606,6 +794,8 @@ _hist_fuzzy_precmd() {
   for action in up down right tab enter cancel pick-{1..9}; do
     zle -N hist-fuzzy-$action _hist_fuzzy_key
   done
+  zle -N hist-fuzzy-mouse _hist_fuzzy_mouse
+  zle -N hist-fuzzy-cursor-report _hist_fuzzy_cursor_report
   add-zle-hook-widget line-init _hist_fuzzy_init
   add-zle-hook-widget line-pre-redraw _hist_fuzzy_draw
   add-zle-hook-widget line-finish _hist_fuzzy_finish
@@ -620,5 +810,5 @@ _hist_fuzzy_precmd() {
 
 histf-diag() {
   print -r -- "history_fuzzy v$_HIST_FUZZY_VERSION; zsh $ZSH_VERSION; ${COLUMNS}x${LINES}"
-  print -r -- "cached=${#_hist_fuzzy_cache}; max_show=$HIST_FUZZY_MAX_SHOW; renderer=ZLE"
+  print -r -- "cached=${#_hist_fuzzy_cache}; max_show=$HIST_FUZZY_MAX_SHOW; renderer=ZLE; mouse=auto"
 }
