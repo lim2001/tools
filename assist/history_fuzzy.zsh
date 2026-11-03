@@ -19,12 +19,16 @@
 # 追加维度：_hist_fuzzy_dim_add name weight '代码；结果放 _hist_fuzzy_dim_val'
 
 [[ -o interactive && -o zle ]] || return 0
-(( ${_HIST_FUZZY_VERSION:-0} >= 19 )) && return 0
+(( ${_HIST_FUZZY_VERSION:-0} >= 20 )) && return 0
 if (( ${_HIST_FUZZY_VERSION:-0} > 0 && _HIST_FUZZY_VERSION < 13 )); then
   print -u2 -- 'history_fuzzy: 请新开 zsh 加载新版，以清除旧版覆盖的部件。'
   return 1
 fi
-typeset -g _HIST_FUZZY_VERSION=19
+# 热重载时迁移旧默认色；保留用户另行配置的选中行配色。
+if (( ${_HIST_FUZZY_VERSION:-0} > 0 )) && [[ $HIST_FUZZY_COLOR_HOVER == bg=cyan,fg=black ]]; then
+  HIST_FUZZY_COLOR_HOVER=bg=23,fg=255
+fi
+typeset -g _HIST_FUZZY_VERSION=20
 zmodload zsh/parameter
 zmodload zsh/zleparameter
 zmodload zsh/zselect
@@ -35,7 +39,10 @@ autoload -Uz add-zle-hook-widget add-zsh-hook
 : ${HIST_FUZZY_MAX_SHOW:=10}
 : ${HIST_FUZZY_MIN_LEN:=1}
 : ${HIST_FUZZY_COLOR_MATCH:=fg=green,bold}
-: ${HIST_FUZZY_COLOR_HOVER:=bg=cyan,fg=black}
+# 256 色深青底 #005f5f、浅色字 #eeeeee、浅绿匹配字 #afffaf。
+# 选中行两种文字的对比度分别为 6.46:1 / 6.33:1，避免绿字叠亮青底。
+: ${HIST_FUZZY_COLOR_HOVER:=bg=23,fg=255}
+: ${HIST_FUZZY_COLOR_HOVER_MATCH:=fg=157,bold}
 : ${HIST_FUZZY_FUZZY_MAX:=4}
 : ${HIST_FUZZY_FUZZY_MIN_LEN:=2}
 : ${HIST_FUZZY_SPAN_SLACK:=3}
@@ -387,6 +394,11 @@ _hist_fuzzy_compose() {
   _hist_fuzzy_update
   (( ${#_hist_fuzzy_shown} )) || { _hist_fuzzy_mouse_off; return 0; }
   local line row colour
+  # 旧版 ZLE 遇到重复 fg 会停止解析；先移除选中行前景，再设置匹配字颜色。
+  local -a hover_match_base=("${(@s:,:)HIST_FUZZY_COLOR_HOVER}")
+  [[ ,$HIST_FUZZY_COLOR_HOVER_MATCH, == *,fg=*,* ]] &&
+    hover_match_base=("${(@)hover_match_base:#fg=*}")
+  local hover_match="${(j:,:)hover_match_base},$HIST_FUZZY_COLOR_HOVER_MATCH"
   local -i i=0 off pos limit=$(( COLUMNS - 1 )) start=${#region_highlight} run end
   # 保留输入和建议的折行空间；很小的终端直接少画几条。
   (( limit >= 8 )) || return 0
@@ -402,14 +414,15 @@ _hist_fuzzy_compose() {
     _hist_fuzzy_suffix+=$'\n'$row
     colour=fg=default,bg=default
     (( i == _hist_fuzzy_hover )) && colour=$HIST_FUZZY_COLOR_HOVER
-    region_highlight+=("$off $((off + ${#row})) $colour memo=history-fuzzy")
+    # 5.8 会把 memo 当成最后一个样式值的一部分；逗号先结束该值。
+    region_highlight+=("$off $((off + ${#row})) $colour, memo=history-fuzzy")
     _hist_fuzzy_score "$_hist_fuzzy_shown[i]"
     colour=$HIST_FUZZY_COLOR_MATCH
-    (( i == _hist_fuzzy_hover )) && colour="$HIST_FUZZY_COLOR_HOVER,$colour"
+    (( i == _hist_fuzzy_hover )) && colour=$hover_match
     run=0 end=0
     for pos in "${_hist_fuzzy_hits[@]}" 0; do
       if (( pos != end + 1 || pos > ${#line} )); then
-        (( run )) && region_highlight+=("$((off + 2 + run)) $((off + 3 + end)) $colour memo=history-fuzzy")
+        (( run )) && region_highlight+=("$((off + 2 + run)) $((off + 3 + end)) $colour, memo=history-fuzzy")
         run=0
       fi
       (( !pos || pos > ${#line} )) && break

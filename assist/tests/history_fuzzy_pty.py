@@ -34,6 +34,19 @@ import time
 import traceback
 
 import pyte
+from pyte.graphics import FG_BG_256
+
+HOVER_BG = FG_BG_256[23]
+HOVER_FG = FG_BG_256[255]
+HOVER_MATCH = FG_BG_256[157]
+
+def contrast(fg, bg):
+    def luminance(color):
+        rgb = [int(color[i:i+2], 16) / 255 for i in (0, 2, 4)]
+        return sum(w * (v / 12.92 if v <= .04045 else ((v + .055) / 1.055) ** 2.4)
+                   for w, v in zip((.2126, .7152, .0722), rgb))
+    low, high = sorted((luminance(fg), luminance(bg)))
+    return (high + .05) / (low + .05)
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--plugin', type=Path, default=Path(__file__).resolve().parents[1] / 'history_fuzzy.zsh')
@@ -93,7 +106,7 @@ class XtermScreen:
         if state['mouse'] != 'none': self.mode.add(1000 << 5)
         if state['encoding'] == 'SGR': self.mode.add(1006 << 5)
         def color(n):
-            return 'default' if n < 0 else self.palette[n] if n < 16 else str(n)
+            return 'default' if n < 0 else self.palette[n] if n < 16 else FG_BG_256[n] if n < 256 else f'{n:06x}'
         self.buffer = {y: {x: self.blank._replace(data=c[0],fg=color(c[1]),bg=color(c[2]))
                            for x,c in enumerate(row)} for y,row in enumerate(state['cells'])}
 
@@ -187,8 +200,11 @@ add-zle-hook-widget line-init _hf_test_ready
     def snapshot(self, label):
         result = {"label": label, "cursor": [self.screen.cursor.y, self.screen.cursor.x],
                   "lines": self.screen.display,
-                  "cyan_rows": [y for y in range(self.rows)
-                                if any(self.screen.buffer[y][x].bg == "cyan" for x in range(self.cols))]}
+                  "selection_styles": sorted({(cell.fg, cell.bg)
+                                              for row in self.screen.buffer.values()
+                                              for cell in row.values() if cell.bg == HOVER_BG}),
+                  "selected_rows": [y for y in range(self.rows)
+                                if any(self.screen.buffer[y][x].bg == HOVER_BG for x in range(self.cols))]}
         (self.home / (label + ".json")).write_text(json.dumps(result, ensure_ascii=False, indent=2))
         return result
 
@@ -290,10 +306,16 @@ def clean(s, data):
 def check_hover(s, idx):
     rows = listed(s)
     assert len(rows) == 10, rows
-    cyan = [y for y in range(s.rows) if any(c.bg == 'cyan' for c in s.screen.buffer[y].values())]
-    assert cyan == [rows[idx-1][0]], (idx, cyan, rows)
-    y = cyan[0]
-    assert all(s.screen.buffer[y][x].bg == 'cyan' for x in range(s.cols-1)), 'hover not full width'
+    selected = [y for y in range(s.rows) if any(c.bg == HOVER_BG for c in s.screen.buffer[y].values())]
+    assert selected == [rows[idx-1][0]], (idx, selected, rows)
+    y = selected[0]
+    cells = [s.screen.buffer[y][x] for x in range(len(rows[idx-1][1]))]
+    glyphs = [cell for cell in cells if cell.data.strip()]
+    assert {cell.fg for cell in glyphs} == {HOVER_FG, HOVER_MATCH}, glyphs
+    assert all(contrast(cell.fg, cell.bg) >= 4.5 for cell in glyphs), 'low contrast selected text'
+    assert all(s.screen.buffer[row][x].bg == 'default'
+               for row, _ in rows if row != y for x in range(s.cols-1)), 'stale selection background'
+    assert all(s.screen.buffer[y][x].bg == HOVER_BG for x in range(s.cols-1)), 'hover not full width'
 
 
 def exercise(mode, cols):
@@ -316,7 +338,7 @@ def exercise(mode, cols):
             assert (s.screen.cursor.y,s.screen.cursor.x) == cursor
             assert b'\x1b[2J' not in raw and b'\n' not in raw, 'hover cleared/scrolled screen'
         s.snapshot('hover')
-        checks.append('CSI first arrow; down down up up; cyan full row; stable cursor/text; no scrolling')
+        checks.append('CSI first arrow; down down up up; dark teal full row; selected text contrast >= 4.5:1; stable cursor/text; no scrolling')
         for key, idx in [(b'\x1bOB',2),(b'\x1bOA',1)]:
             s.send(key, .12)
             check_hover(s, idx)
@@ -327,7 +349,7 @@ def exercise(mode, cols):
         executed = rows[2][1][3:].removeprefix('record ') + '\n'
         s.send(b'\x1b[B\x1b[B\r')
         assert (s.home/'executed').read_text() == executed, (s.home/'executed').read_text()
-        assert not listed(s) and not s.snapshot('entered')['cyan_rows']
+        assert not listed(s) and not s.snapshot('entered')['selected_rows']
         checks.append('Enter after explicit selection fills and executes selected item exactly once')
         s.send('record MANUAL\r')
         executed += 'MANUAL\n'
@@ -448,7 +470,7 @@ run('empty history','vi','fc -p $HOME/empty 0\n',empty)
 def fifteen(s):
     s.send('record MANUAL');assert len(listed(s))==15
     s.snapshot('fifteen')
-    s.send(b'\x1b[A');assert s.snapshot('wrap-up')['cyan_rows']==[listed(s)[-1][0]]
+    s.send(b'\x1b[A');assert s.snapshot('wrap-up')['selected_rows']==[listed(s)[-1][0]]
 run('15 results and navigation wrap','omz','HIST_FUZZY_MAX_SHOW=15\n',fifteen)
 
 def resize(s):
@@ -459,9 +481,9 @@ def resize(s):
         b=probe(s)
         assert b=='record MANUAL',b
         assert 0 < len(listed(s)) <= min(10,rows-4), listed(s)
-        cyan=s.snapshot(f'resize-{cols}x{rows}')['cyan_rows']
-        assert len(cyan)==1,cyan
-        assert all(s.screen.buffer[cyan[0]][x].bg=='cyan' for x in range(cols-1))
+        selected=s.snapshot(f'resize-{cols}x{rows}')['selected_rows']
+        assert len(selected)==1,selected
+        assert all(s.screen.buffer[selected[0]][x].bg==HOVER_BG for x in range(cols-1))
 run('terminal resize','omz','',resize)
 
 def edit(s):
@@ -669,7 +691,7 @@ def cd_selected(s, enter=b'\r'):
     s.send(b'\x1b[B'*8)
     assert probe(s)=='cd disk'  # Selection itself still does not change the input row.
     selected=s.snapshot('selected-item-09')
-    assert selected['cyan_rows']==[rows[8][0]],selected
+    assert selected['selected_rows']==[rows[8][0]],selected
     s.send(enter,.3)
     expected=str(s.home/'completion/disk/rk3588')
     actual=(s.home/'directories').read_text().splitlines()
@@ -746,8 +768,8 @@ def mouse_cd(s):
     caret=before['cursor']
     painted=s.mouse(y=y)
     press=s.snapshot('direct-click-press')
-    assert press['cyan_rows']==[y-1],press
-    assert all(s.screen.buffer[y-1][x].bg=='cyan' for x in range(s.cols-1))
+    assert press['selected_rows']==[y-1],press
+    assert all(s.screen.buffer[y-1][x].bg==HOVER_BG for x in range(s.cols-1))
     assert press['lines']==before['lines'] and press['cursor']==caret, 'click moved text or input cursor'
     assert b'\x1b[2J' not in painted
     assert not (s.home/'accepted-commands').exists()
@@ -763,7 +785,7 @@ def mouse_cd(s):
         row=current[idx-1][0]+1
         s.mouse(y=row);s.mouse(y=row,release=True)
         mouse_filled(s, rows[idx-1][1][3:], rows)
-        assert s.snapshot(f'reselected-{idx:02d}')['cyan_rows']==[row-1]
+        assert s.snapshot(f'reselected-{idx:02d}')['selected_rows']==[row-1]
         first_row=listed(s)[0][0]
         assert all(s.screen.buffer[first_row][x].fg=='green' for x in range(3,10))
     s.send(b'\r',.3)
@@ -823,7 +845,7 @@ def mouse_resize(s):
         assert probe(s)=='record MANUAL'
         assert (s.home/'state').read_text().split()[-2:]==[str(cols),str(rows)]
         assert not (s.home/'executed').exists()
-        assert len(s.snapshot(f'auto-resize-{cols}-{rows}')['cyan_rows'])==1
+        assert len(s.snapshot(f'auto-resize-{cols}-{rows}')['selected_rows'])==1
     entries=listed(s)
     y=entries[2][0]+1
     expected=entries[2][1][3:].removeprefix('record ')
@@ -1058,6 +1080,9 @@ run('mouse: preserved menu still supports arrow selection and Enter','omz','',mo
 
 report = {
     'plugin': PLUGIN,
+    'selection_palette': {'background': HOVER_BG, 'text': HOVER_FG, 'match': HOVER_MATCH,
+                          'text_contrast': contrast(HOVER_FG, HOVER_BG),
+                          'match_contrast': contrast(HOVER_MATCH, HOVER_BG)},
     'terminal': str(args.xterm_headless) if args.xterm_headless else 'pyte with CPR replies',
     'sha256': hashlib.sha256(Path(PLUGIN).read_bytes()).hexdigest(),
     'matrix': matrix,
