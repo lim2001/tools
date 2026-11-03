@@ -3,7 +3,8 @@
 
 Run: python3 assist/tests/history_fuzzy_pty.py
 Optional: --omz /path/to/oh-my-zsh --plugin /path/to/history_fuzzy.zsh
-Use --mouse-only for automatic mouse cases, --focused for native keys/Enter.
+Use --mouse-only for mouse cases, --focused for native keys/Enter,
+and --history-only for empty-input menus and PageUp/PageDown.
 Each child uses an empty environment, a fresh HOME and a private plugin copy.
 Only synthetic history is loaded. The PTY and terminal emulator share dimensions.
 CPR replies come from the emulator's cursor, with separate no-response cases.
@@ -51,6 +52,7 @@ def contrast(fg, bg):
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--plugin', type=Path, default=Path(__file__).resolve().parents[1] / 'history_fuzzy.zsh')
 parser.add_argument('--omz', type=Path, default=Path.home() / '.oh-my-zsh')
+parser.add_argument('--history-only', action='store_true', help='only empty-input menu and PageUp/PageDown cases')
 parser.add_argument('--mouse-only', action='store_true', help='only automatic mouse regressions')
 parser.add_argument('--xterm-headless', type=Path, help='optional installed @xterm/headless directory')
 parser.add_argument('--focused', action='store_true', help='only native key and Enter selection regressions')
@@ -299,7 +301,17 @@ def listed(s):
 
 
 def clean(s, data):
+    # In native menu-select the first Ctrl-C cancels completion, restoring the
+    # original input. Wait for an actual new ZLE line before typing the next case.
+    ready = s.home / 'ready'
+    previous = ready.stat().st_mtime_ns
     s.send(b'\x03', .08)
+    if ready.stat().st_mtime_ns == previous:
+        s.send(b'\x03', .08)
+    deadline = time.monotonic() + 3
+    while ready.stat().st_mtime_ns == previous:
+        assert time.monotonic() < deadline, 'Ctrl-C did not start a fresh input line'
+        s.read(.02)
     s.send(data, .15)
 
 
@@ -370,7 +382,7 @@ def exercise(mode, cols):
         assert probe(s) == 'echo' and not listed(s)
         s.send(' s')
         assert listed(s)
-        checks.append('Ctrl-G closes until next edit; normal input resumes')
+        checks.append('Ctrl-G closes; normal input resumes')
         clean(s, 'echo')
         s.send(b'\x03')
         assert probe(s) == '' and not listed(s)
@@ -438,7 +450,7 @@ def exercise(mode, cols):
 
 
 matrix=[]
-for mode in (() if args.focused or args.mouse_only else ('vi','emacs','omz')):
+for mode in (() if args.focused or args.mouse_only or args.history_only else ('vi','emacs','omz')):
     for cols in (80,100):
         result=exercise(mode,cols)
         matrix.append(result)
@@ -446,6 +458,8 @@ for mode in (() if args.focused or args.mouse_only else ('vi','emacs','omz')):
 
 edge_results=[]
 def run(name, mode, extra, test, cols=100, rows=24, cpr=True):
+    if args.history_only and not name.startswith('history keys:'):
+        return
     if args.mouse_only and not name.startswith('mouse:'):
         return
     if args.focused and not name.startswith(('native keys:', 'Enter selection:')):
@@ -635,6 +649,26 @@ def native_completion_with_history(s):
     assert not (s.home/'executed').exists()
 run('native keys: Tab opens native completion even with matching history',
     'omz',NATIVE_HISTORY,native_completion_with_history)
+
+def native_menu_arrows(s):
+    s.send('cat native-file-')
+    ready = (s.home/'ready').stat().st_mtime_ns
+    s.send(b'\t\t\t', .4)
+    first = s.screen.display[s.screen.cursor.y]
+    assert 'native-file-' in first
+    s.send(b'\x1b[B')
+    second = s.screen.display[s.screen.cursor.y]
+    assert second != first, (first, second)
+    s.send(b'\x1b[A')
+    assert s.screen.display[s.screen.cursor.y] == first
+    s.send(b'\r')
+    assert (s.home/'ready').stat().st_mtime_ns == ready, 'completion Enter executed the command'
+    assert re.fullmatch(r'cat native-file-\d\d-long-name\s*', probe(s)), probe(s)
+    assert not listed(s)
+    clean(s, 'record MANUAL')
+    assert probe(s) == 'record MANUAL' and listed(s)
+run('native keys: completion menu arrows select files and Enter only accepts completion',
+    'omz', 'touch native-file-{01..24}-long-name\n', native_menu_arrows)
 
 def explicit_selection(s):
     query='record PRIORITY'
@@ -1077,6 +1111,183 @@ def mouse_preserved_keyboard(s):
     assert (s.home/'executed').read_text()==entries[7][1][3:].removeprefix('record ')+'\n'
     mouse_closed(s)
 run('mouse: preserved menu still supports arrow selection and Enter','omz','',mouse_preserved_keyboard)
+
+RECENT_COMMANDS = [f'record RECENT-{n:02d}' for n in range(1, 15)] + ['record RECENT-most-recent-long-15']
+RECENT_HISTORY = 'fc -p $HOME/recent-history 100\n' + ''.join(
+    'print -s -- ' + shlex.quote(cmd) + '\n' for cmd in RECENT_COMMANDS)
+
+def recent_rows(s, expected=None):
+    expected = expected or list(reversed(RECENT_COMMANDS))[:10]
+    rows = listed(s)
+    assert [line[3:] for _, line in rows] == expected, rows
+    # No fuzzy query exists: neither selected nor unselected rows inherit green hits.
+    for y, line in rows:
+        for x in range(len(line)):
+            cell = s.screen.buffer[y][x]
+            assert cell.fg == (HOVER_FG if cell.bg == HOVER_BG else 'default'), cell
+    return rows
+
+def recent_selected(s, index, expected=None):
+    rows = recent_rows(s, expected)
+    assert s.snapshot(f'recent-selected-{index}')['selected_rows'] == [rows[index-1][0]]
+    assert all(s.screen.buffer[rows[index-1][0]][x].bg == HOVER_BG for x in range(s.cols-1))
+
+def recent_menu(s):
+    assert probe(s) == '' and not listed(s)
+    mouse_closed(s)
+    for opening in (b'\x1b[A', b'\x1b[B', b'\x1bOA', b'\x1bOB'):
+        clean(s, '')
+        s.send(opening)
+        assert probe(s) == ''
+        recent_selected(s, 1)
+        before = list(s.screen.display)
+        cursor = (s.screen.cursor.y, s.screen.cursor.x)
+        for key, index in ((b'\x1b[B', 2), (b'\x1bOA', 1), (b'\x1b[A', 10), (b'\x1bOB', 1)):
+            raw = s.send(key)
+            recent_selected(s, index)
+            assert s.screen.display == before
+            assert (s.screen.cursor.y, s.screen.cursor.x) == cursor
+            assert b'\n' not in raw and b'\x1b[2J' not in raw
+            assert probe(s) == ''
+        s.send(b'\x07')
+        assert probe(s) == '' and not listed(s)
+        mouse_closed(s)
+    s.send(b'\x1b[B\x1b[B\r')
+    assert (s.home/'executed').read_text() == 'RECENT-14\n'
+    assert probe(s) == '' and not listed(s)
+    s.send(b'\r')
+    assert (s.home/'executed').read_text() == 'RECENT-14\n'
+    for keymap in ('main', 'viins', 'vicmd'):
+        assert (s.home/(keymap+'.before')).read_bytes() == (s.home/(keymap+'.after')).read_bytes()
+    return {'order': 'newest first', 'first_arrow_selects': 1, 'typing_required': False}
+
+for mode in ('vi', 'emacs', 'omz'):
+    for cols in (80, 100):
+        run(f'history keys: empty arrows show recent history, {mode}, {cols} columns',
+            mode, RECENT_HISTORY, recent_menu, cols=cols)
+
+def recent_transitions(s):
+    s.send(b'\x1b[A')
+    recent_selected(s, 1)
+    s.send('record RECENT')
+    assert probe(s) == 'record RECENT'
+    assert listed(s)[0][1][3:] == 'record RECENT-14', listed(s)
+    assert s.screen.buffer[listed(s)[1][0]][3].fg == 'green'
+    s.send(b'\x15')
+    assert probe(s) == '' and not listed(s)
+    s.send(b'\x1b[B')
+    recent_selected(s, 1)
+    s.send(b'X\x7f')
+    assert probe(s) == '' and not listed(s)
+    s.send(b'\x1b[A\t')
+    assert probe(s) == RECENT_COMMANDS[-1] and not listed(s)
+    assert not (s.home/'executed').exists()
+    clean(s, 'zzzzNoMatch')
+    for key in (b'\x1b[A', b'\x1b[B', b'\x1bOA', b'\x1bOB'):
+        s.send(key)
+        assert probe(s) == 'zzzzNoMatch' and not listed(s)
+    clean(s, '')
+    s.send(b'\x1b[A\x07\x1b[B')
+    assert probe(s) == ''
+    recent_selected(s, 1)
+    s.send(b'\x03')
+    assert probe(s) == '' and not listed(s)
+    mouse_closed(s)
+    s.send(b'\x1b[A')
+    recent_selected(s, 1)
+    s.send(b'\x1b', .3)
+    assert probe(s) == '' and not listed(s)
+    mouse_closed(s)
+    s.send('i')
+    assert probe(s) == '' and not listed(s)
+    s.send(b'\x1b[B')
+    recent_selected(s, 1)
+run('history keys: edit changes recent menu to fuzzy search; empty/no match never recalls native history',
+    'omz', RECENT_HISTORY, recent_transitions)
+
+def history_pages(s, mode):
+    empty_plugin = ARTIFACTS/'history-disabled.zsh'
+    empty_plugin.write_text('')
+    baseline = Session(config(mode, RECENT_HISTORY + "bindkey -M main '\\e[A' up-history\nbindkey -M main '\\e[B' down-history\n"),
+                       cols=s.cols, plugin=empty_plugin)
+    observations = []
+    try:
+        for query in ('', 'record RECENT'):
+            clean(s, query)
+            clean(baseline, query)
+            if query:
+                s.send(b'\x1b[B')  # A fuzzy selection must not steal PageUp.
+            for page, original in ((b'\x1b[5~', b'\x1b[A'),)*3 + ((b'\x1b[6~', b'\x1b[B'),)*3:
+                s.send(page)
+                baseline.send(original)
+                actual, expected = probe(s), probe(baseline)
+                assert actual == expected, (page, actual, expected)
+                assert not listed(s), 'PageUp/PageDown unexpectedly reopened fuzzy results'
+                mouse_closed(s)
+                observations.append(actual)
+            assert probe(s) == query
+        assert not (s.home/'executed').exists()
+        return observations
+    finally:
+        baseline.close()
+for mode in ('vi', 'emacs', 'omz'):
+    run(f'history keys: PageUp/PageDown match native history navigation, {mode}',
+        mode, RECENT_HISTORY, lambda s, mode=mode: history_pages(s, mode))
+
+def recent_mouse(s):
+    s.send(b'\x1b[A')
+    entries = recent_rows(s)
+    for idx in (9, 2):
+        y = listed(s)[idx-1][0] + 1
+        s.mouse(y=y); s.mouse(y=y, release=True)
+        mouse_filled(s, entries[idx-1][1][3:], entries)
+        recent_selected(s, idx)
+    s.send(b'\r')
+    assert (s.home/'executed').read_text() == 'RECENT-14\n'
+    assert probe(s) == '' and not listed(s)
+    mouse_closed(s)
+run('history keys: mouse can choose twice from preserved recent history; Enter executes last choice',
+    'omz', RECENT_HISTORY, recent_mouse)
+
+def recent_pages_after_mouse(s):
+    s.send(b'\x1b[A')
+    entries = recent_rows(s)
+    y = entries[8][0] + 1
+    s.mouse(y=y); s.mouse(y=y, release=True)
+    mouse_filled(s, entries[8][1][3:], entries)
+    s.send(b'\x1b[5~')
+    assert probe(s) == RECENT_COMMANDS[-1] and not listed(s)
+    s.send(b'\x1b[6~')
+    assert probe(s) == entries[8][1][3:] and not listed(s)
+    mouse_closed(s)
+    assert not (s.home/'executed').exists()
+run('history keys: PageUp/PageDown close pinned mouse menu and restore the input',
+    'omz', RECENT_HISTORY, recent_pages_after_mouse)
+
+def recent_empty(s):
+    for key in (b'\x1b[A', b'\x1b[B', b'\x1bOA', b'\x1bOB', b'\x1b[5~', b'\x1b[6~'):
+        s.send(key)
+        assert probe(s) == '' and not listed(s)
+        mouse_closed(s)
+run('history keys: empty history leaves empty input and no menu',
+    'omz', 'fc -p $HOME/no-history 100\n', recent_empty)
+
+def recent_disabled(s):
+    for key in (b'\x1b[A', b'\x1b[B'):
+        s.send(key)
+        assert probe(s) == '' and not listed(s)
+        mouse_closed(s)
+    s.send(b'\x1b[5~')
+    assert probe(s) == RECENT_COMMANDS[-1] and not listed(s)
+run('history keys: max_show zero disables menu but keeps PageUp history available',
+    'omz', RECENT_HISTORY + 'HIST_FUZZY_MAX_SHOW=0\n', recent_disabled)
+
+def recent_filtered(s):
+    s.send(b'\x1b[A')
+    recent_selected(s, 1, list(reversed(RECENT_COMMANDS)))
+    assert len(listed(s)) == 15
+run('history keys: recent order deduplicates, filters ignored commands and respects max 15',
+    'omz', RECENT_HISTORY + "HIST_FUZZY_MAX_SHOW=15\nprint -s -- 'record RECENT-most-recent-long-15'\nprint -s -- 'shl'\n", recent_filtered)
 
 report = {
     'plugin': PLUGIN,

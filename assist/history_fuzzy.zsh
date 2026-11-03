@@ -1,5 +1,7 @@
 #!/usr/bin/env zsh
 # 历史实时下拉：输入行下方最多 10 条（HIST_FUZZY_MAX_SHOW 可设为 15）。
+# 输入模式下 ↑/↓ 只控制列表；空输入时首次按键打开最近历史并选中第一项。
+# PageUp/PageDown 逐条调取较旧/较新的原生历史到输入行。
 # Tab/→ 默认保留输入行原有补全；先按 ↑/↓ 选择历史项后，Tab/→ 才填该项。
 # Alt-1..9 直接填历史项；Ctrl-G 收起；主动选择历史项后回车填入并执行该项，
 # 未主动选择或已返回输入行编辑时，回车只执行 BUFFER。
@@ -19,16 +21,16 @@
 # 追加维度：_hist_fuzzy_dim_add name weight '代码；结果放 _hist_fuzzy_dim_val'
 
 [[ -o interactive && -o zle ]] || return 0
-(( ${_HIST_FUZZY_VERSION:-0} >= 20 )) && return 0
+(( ${_HIST_FUZZY_VERSION:-0} >= 21 )) && return 0
 if (( ${_HIST_FUZZY_VERSION:-0} > 0 && _HIST_FUZZY_VERSION < 13 )); then
   print -u2 -- 'history_fuzzy: 请新开 zsh 加载新版，以清除旧版覆盖的部件。'
   return 1
 fi
 # 热重载时迁移旧默认色；保留用户另行配置的选中行配色。
-if (( ${_HIST_FUZZY_VERSION:-0} > 0 )) && [[ $HIST_FUZZY_COLOR_HOVER == bg=cyan,fg=black ]]; then
+if (( ${_HIST_FUZZY_VERSION:-0} > 0 && _HIST_FUZZY_VERSION < 20 )) && [[ $HIST_FUZZY_COLOR_HOVER == bg=cyan,fg=black ]]; then
   HIST_FUZZY_COLOR_HOVER=bg=23,fg=255
 fi
-typeset -g _HIST_FUZZY_VERSION=20
+typeset -g _HIST_FUZZY_VERSION=21
 zmodload zsh/parameter
 zmodload zsh/zleparameter
 zmodload zsh/zselect
@@ -261,7 +263,15 @@ _hist_fuzzy_build() {
   local -a exact prefix boundary substr abbrev multi fuzzy group ranked
   local -A seen
   _hist_fuzzy_result=()
+  _hist_fuzzy_qchr=() _hist_fuzzy_qpat=() _hist_fuzzy_toks=() _hist_fuzzy_hits=()
   q=${${q##[[:space:]]#}%%[[:space:]]#}
+  # 空输入由方向键显式打开最近历史；沿用缓存的去重和过滤，保持时间顺序。
+  if [[ -z $q ]]; then
+    if (( _hist_fuzzy_recent && HIST_FUZZY_MAX_SHOW > 0 && ${#_hist_fuzzy_cache} )); then
+      _hist_fuzzy_result=("${(@)_hist_fuzzy_cache[1,HIST_FUZZY_MAX_SHOW]}")
+    fi
+    return 0
+  fi
   (( ${#q} >= HIST_FUZZY_MIN_LEN && HIST_FUZZY_MAX_SHOW > 0 )) || return 0
   [[ $q == *[[:cntrl:]]* ]] && return 0
   _hist_fuzzy_qchr=("${(@s::)q}")
@@ -327,6 +337,7 @@ typeset -g _hist_fuzzy_mouse_enabled=0 _hist_fuzzy_mouse_pressed=0
 typeset -g _hist_fuzzy_mouse_buffer='' _hist_fuzzy_mouse_command=''
 typeset -g _hist_fuzzy_mouse_first=0 _hist_fuzzy_mouse_size=''
 typeset -g _hist_fuzzy_pinned=0 _hist_fuzzy_pinned_buffer=''
+typeset -g _hist_fuzzy_recent=0
 typeset -g _hist_fuzzy_suppressed='' _hist_fuzzy_closed=0 _hist_fuzzy_hover=1
 typeset -g _hist_fuzzy_engaged=0 _hist_fuzzy_selection_cursor=0
 typeset -g _hist_fuzzy_busy=0 _hist_fuzzy_active=0
@@ -355,8 +366,14 @@ _hist_fuzzy_detach() {
 
 _hist_fuzzy_update() {
   emulate -L zsh
+  # 翻页键调取历史时，建议插件的中间重绘也保持列表收起。
+  (( ${_hist_fuzzy_history_browsing:-0} )) && { _hist_fuzzy_shown=(); return 0; }
   # 鼠标填入不改变查询及其高亮；用户修改文字后才重新搜索。
   [[ $BUFFER == "$_hist_fuzzy_pinned_buffer" ]] || _hist_fuzzy_pinned=0
+  if (( _hist_fuzzy_recent && ! _hist_fuzzy_pinned )) && [[ -n $BUFFER ]]; then
+    _hist_fuzzy_recent=0
+    _hist_fuzzy_query=$'\0'
+  fi
   if (( _hist_fuzzy_closed )); then
     [[ $BUFFER == "$_hist_fuzzy_suppressed" ]] && { _hist_fuzzy_shown=(); return 0; }
     _hist_fuzzy_closed=0
@@ -416,7 +433,8 @@ _hist_fuzzy_compose() {
     (( i == _hist_fuzzy_hover )) && colour=$HIST_FUZZY_COLOR_HOVER
     # 5.8 会把 memo 当成最后一个样式值的一部分；逗号先结束该值。
     region_highlight+=("$off $((off + ${#row})) $colour, memo=history-fuzzy")
-    _hist_fuzzy_score "$_hist_fuzzy_shown[i]"
+    _hist_fuzzy_hits=()
+    (( ${#_hist_fuzzy_qchr} )) && _hist_fuzzy_score "$_hist_fuzzy_shown[i]"
     colour=$HIST_FUZZY_COLOR_MATCH
     (( i == _hist_fuzzy_hover )) && colour=$hover_match
     run=0 end=0
@@ -438,6 +456,7 @@ _hist_fuzzy_compose() {
 
 _hist_fuzzy_dismiss() {
   _hist_fuzzy_pinned=0
+  _hist_fuzzy_recent=0
   _hist_fuzzy_mouse_off
   _hist_fuzzy_detach
   _hist_fuzzy_closed=1
@@ -474,7 +493,13 @@ _hist_fuzzy_call() {
     if [[ $BUFFER != "$hf_before_buffer" ]] || (( CURSOR != hf_before_cursor )); then
       _hist_fuzzy_engaged=0
     fi
-    [[ $BUFFER == "$hf_before_buffer" ]] || _hist_fuzzy_pinned=0
+    if [[ $BUFFER != "$hf_before_buffer" ]]; then
+      _hist_fuzzy_pinned=0
+      if (( _hist_fuzzy_recent )); then
+        _hist_fuzzy_recent=0
+        _hist_fuzzy_query=$'\0'
+      fi
+    fi
     if (( completion )); then _hist_fuzzy_suppressed=$BUFFER; fi
     if [[ $KEYMAP == "$_hist_fuzzy_base" ]] && (( _hist_fuzzy_active )); then
       zle -K "${_hist_fuzzy_maps[$_hist_fuzzy_base]}"
@@ -489,8 +514,16 @@ _hist_fuzzy_key() {
   _hist_fuzzy_mouse_pressed=0
   emulate -L zsh
   local action=${WIDGET#hist-fuzzy-}
-  local -i idx
+  local -i idx opening=0
   _hist_fuzzy_detach
+  if [[ $action == up || $action == down ]]; then
+    if (( _hist_fuzzy_closed )) || { [[ -z $BUFFER ]] && (( ! _hist_fuzzy_recent )); }; then
+      [[ -z $BUFFER ]] && _hist_fuzzy_recent=1
+      _hist_fuzzy_closed=0
+      _hist_fuzzy_query=$'\0'
+      opening=1
+    fi
+  fi
   _hist_fuzzy_update
   # 默认青色行只是预览；主动选择后 Tab/→ 填入，Enter 填入并执行。
   if (( ${#_hist_fuzzy_shown} )) &&
@@ -499,6 +532,8 @@ _hist_fuzzy_key() {
       up|down)
         _hist_fuzzy_engaged=1
         _hist_fuzzy_selection_cursor=$CURSOR
+        # 首次空输入打开时选第一项；此后方向键只移动列表高亮。
+        (( opening )) && return 0
         if [[ $action == up ]]; then
           (( _hist_fuzzy_hover = (_hist_fuzzy_hover + ${#_hist_fuzzy_shown} - 2) % ${#_hist_fuzzy_shown} + 1 ))
         else
@@ -518,8 +553,23 @@ _hist_fuzzy_key() {
     # 回车继续调用原来的绑定；填入、收起已完成，原生接受部件只执行一次。
     [[ $action == enter ]] || return 0
   fi
+  # 无匹配、无历史、窗口太小等情况也不回退到原生历史导航。
+  [[ $action == up || $action == down ]] && return 0
   # 未主动选择（即使有列表）也按当前原生绑定执行，包括用户自定义的灰字接受键。
   _hist_fuzzy_native_key "$KEYS" "$@"
+}
+
+# 单独的翻页键路径：调用原生历史部件（含插件包装），不触发模糊列表。
+_hist_fuzzy_history_key() {
+  local -i _hist_fuzzy_history_browsing=1
+  local original=up-history
+  [[ $WIDGET == *-down ]] && original=down-history
+  _hist_fuzzy_dismiss
+  {
+    _hist_fuzzy_call "$original" "$@"
+  } always {
+    _hist_fuzzy_suppressed=$BUFFER
+  }
 }
 
 _hist_fuzzy_native_key() {
@@ -711,6 +761,8 @@ _hist_fuzzy_make_map() {
     else words=(bindkey -M "$map" "${(@)words[2,-1]}"); fi
     "${words[@]}"
   done
+  bindkey -M "$map" '\e[5~' hist-fuzzy-history-up
+  bindkey -M "$map" '\e[6~' hist-fuzzy-history-down
   # vicmd 也用副本消费迟到的终端回报；所有编辑键继续委托原生部件。
   if [[ $base == vicmd ]]; then
     bindkey -M "$map" '\e[<' hist-fuzzy-mouse
@@ -733,6 +785,7 @@ _hist_fuzzy_make_map() {
 
 _hist_fuzzy_init() {
   _hist_fuzzy_pinned=0
+  _hist_fuzzy_recent=0
   _hist_fuzzy_active=1
   _hist_fuzzy_suffix=''
   _hist_fuzzy_retired_suffix=''
@@ -754,6 +807,8 @@ _hist_fuzzy_select() {
       zle -K "${_hist_fuzzy_maps[$KEYMAP]}" ;;
     vicmd)
       _hist_fuzzy_pinned=0
+      (( _hist_fuzzy_recent )) && _hist_fuzzy_query=$'\0'
+      _hist_fuzzy_recent=0
       _hist_fuzzy_mouse_off
       _hist_fuzzy_detach
       _hist_fuzzy_shown=()
@@ -769,6 +824,7 @@ _hist_fuzzy_select() {
 
 _hist_fuzzy_finish() {
   _hist_fuzzy_pinned=0
+  _hist_fuzzy_recent=0
   _hist_fuzzy_mouse_off
   _hist_fuzzy_active=0
   _hist_fuzzy_detach
@@ -795,6 +851,7 @@ _hist_fuzzy_suggest_highlight() {
 
 _hist_fuzzy_precmd() {
   _hist_fuzzy_pinned=0
+  _hist_fuzzy_recent=0
   _hist_fuzzy_mouse_off
   # SIGINT 跳过 line-finish；ZLE 已把光标放在列表末尾的下一行。
   # 仅在这条退出路径按已知列表行数相对上移并清除，完全不查询绝对光标位置。
@@ -819,6 +876,8 @@ _hist_fuzzy_precmd() {
   for action in up down right tab enter cancel pick-{1..9}; do
     zle -N hist-fuzzy-$action _hist_fuzzy_key
   done
+  zle -N hist-fuzzy-history-up _hist_fuzzy_history_key
+  zle -N hist-fuzzy-history-down _hist_fuzzy_history_key
   zle -N hist-fuzzy-mouse _hist_fuzzy_mouse
   zle -N hist-fuzzy-cursor-report _hist_fuzzy_cursor_report
   add-zle-hook-widget line-init _hist_fuzzy_init
