@@ -7,6 +7,7 @@ Use --mouse-only for mouse cases, --focused for native keys/Enter,
 and --history-only for empty-input menus and PageUp/PageDown.
 Use --preview-only for gray previews and 10-to-20-row expansion,
 or --preserve-only for editing existing input after arrow navigation.
+Use --ranking-only for time-first matching and recent-command promotion.
 Each child uses an empty environment, a fresh HOME and a private plugin copy.
 Only synthetic history is loaded. The PTY and terminal emulator share dimensions.
 CPR replies come from the emulator's cursor, with separate no-response cases.
@@ -54,6 +55,7 @@ def contrast(fg, bg):
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--plugin', type=Path, default=Path(__file__).resolve().parents[1] / 'easyCmd.zsh')
 parser.add_argument('--omz', type=Path, default=Path.home() / '.oh-my-zsh')
+parser.add_argument('--ranking-only', action='store_true', help='only recency ranking regressions')
 parser.add_argument('--preserve-only', action='store_true', help='only original input preservation regressions')
 parser.add_argument('--preview-only', action='store_true', help='only gray preview and 10-to-20 row expansion cases')
 parser.add_argument('--scroll-only', action='store_true', help='only scrolling and live input selection cases')
@@ -460,7 +462,7 @@ def exercise(mode, cols):
 
 
 matrix=[]
-for mode in (() if args.focused or args.mouse_only or args.history_only or args.scroll_only or args.preview_only or args.preserve_only else ('vi','emacs','omz')):
+for mode in (() if args.focused or args.mouse_only or args.history_only or args.scroll_only or args.preview_only or args.preserve_only or args.ranking_only else ('vi','emacs','omz')):
     for cols in (80,100):
         result=exercise(mode,cols)
         matrix.append(result)
@@ -468,6 +470,8 @@ for mode in (() if args.focused or args.mouse_only or args.history_only or args.
 
 edge_results=[]
 def run(name, mode, extra, test, cols=100, rows=24, cpr=True):
+    if args.ranking_only and not name.startswith('ranking:'):
+        return
     if args.preserve_only and not name.startswith('preview: preserve'):
         return
     if args.preview_only and not name.startswith('preview:'):
@@ -613,9 +617,11 @@ for n in {0001..2200}; do print -s -- "git fetch repo-$n --branch feature-$n"; d
 ''',perf)
 
 NATIVE_HISTORY = r'''
+print -s -- 'record PRIORITY'
 print -s -- 'record PRIORITY-s'
 print -s -- 'record PRIORITY-medium'
 print -s -- 'record PRIORITY-most-recent-long'
+print -s -- 'record --new PRIORITY'
 print -s -- 'cat alphabet-from-history'
 '''
 NATIVE_TAB = "bindkey -M main '^I' autosuggest-accept\nbindkey -L -M main > $HOME/main.before\n"
@@ -633,7 +639,7 @@ def native_suggestion(s):
         for key in (b'\t', b'\x1b[C', b'\x1bOC'):
             clean(baseline,before)
             clean(s,before)
-            assert listed(s)[0][1][3:]=='record PRIORITY-s'
+            assert listed(s)[0][1][3:]=='record --new PRIORITY'
             # Before the key, the editable row and grey suggestion match the baseline.
             assert s.screen.display[s.screen.cursor.y]==baseline.screen.display[baseline.screen.cursor.y]
             snapshot=s.snapshot('native-before-'+key.hex())
@@ -648,7 +654,7 @@ def native_suggestion(s):
             assert (s.home/'main.before').read_bytes()==(s.home/'main.after').read_bytes()
             assert not (s.home/'executed').exists()
             observations.append({'key':key.hex(),'baseline':original,'with_plugin':actual,
-                                 'list_first':'record PRIORITY-s','grey':expected})
+                                 'list_first':'record --new PRIORITY','grey':expected})
         return observations
     finally:
         baseline.close()
@@ -695,9 +701,9 @@ def explicit_selection(s):
     grey=query+'-most-recent-long'
     for key in (b'\t',b'\x1b[C',b'\x1bOC'):
         clean(s,query)
-        expected=listed(s)[1][1][3:]
+        expected=listed(s)[2][1][3:]
         assert expected==query+'-medium' and expected!=grey
-        s.send(b'\x1b[B')
+        s.send(b'\x1b[B'*2)
         s.send(key)
         assert probe(s)==expected
         assert not listed(s) and not (s.home/'executed').exists()
@@ -721,14 +727,14 @@ def explicit_selection(s):
     assert probe(s)==grey
     clean(s,query)
     s.send(b'\x1b1')
-    assert probe(s)==query+'-s'
+    assert probe(s)=='record --new PRIORITY'
     assert not (s.home/'executed').exists()
 run('native keys: explicit selection, cursor movement, edit, dismissal and Alt-1',
     'omz',NATIVE_HISTORY+NATIVE_TAB,explicit_selection)
 
 CD_HISTORY = r'''
 mkdir -p $HOME/completion/disk/{a,b,c,d,e,f,g,h,rk3588,zzzzzzzzzz}
-for name in a b c d e f g h rk3588 zzzzzzzzzz; do print -s -- "cd disk/$name"; done
+for name in zzzzzzzzzz rk3588 h g f e d c b a; do print -s -- "cd disk/$name"; done
 _ec_cd_changed() { print -r -- "$PWD" >> $HOME/directories; }
 _ec_command_accepted() { print -r -- "$1" >> $HOME/accepted-commands; }
 add-zsh-hook chpwd _ec_cd_changed
@@ -1195,7 +1201,7 @@ def recent_transitions(s):
     recent_selected(s, 1)
     s.send('\x15record RECENT')
     assert probe(s) == 'record RECENT'
-    assert listed(s)[0][1][3:] == 'record RECENT-14', listed(s)
+    assert listed(s)[0][1][3:] == RECENT_COMMANDS[-1], listed(s)
     assert s.screen.buffer[listed(s)[1][0]][3].fg == 'green'
     s.send(b'\x15')
     assert probe(s) == '' and not listed(s)
@@ -1695,6 +1701,129 @@ def preserve_unicode(s):
     assert (s.home/'executed').read_text()=='中文路径一\n'
 run('preview: preserve Unicode non-prefix query without mixing preview into input',
     'omz',"fc -p $HOME/unicode-history 100\nprint -s -- 'record 中文路径二'\nprint -s -- 'record 中文路径一'\n",preserve_unicode)
+
+
+# All accepted matches use last-use order, without length penalties or usage counts.
+RANK_PREFIX='record RANK'
+RANK_LATEST=RANK_PREFIX+'-newest-with-longer-path-and-options-than-the-older-commands'
+RANK_COMMANDS=[RANK_PREFIX+f'-{n:02d}' for n in range(1,16)]+[RANK_LATEST]
+RANK_HISTORY='fc -p $HOME/rank-history 200\n'+''.join('print -s -- '+shlex.quote(c)+'\n' for c in RANK_COMMANDS)
+
+def rank_prefix(s):
+    s.send(RANK_PREFIX)
+    rows=listed(s)
+    assert rows[0][1][3:]==RANK_LATEST,rows
+    assert [line[3:] for _,line in rows]==list(reversed(RANK_COMMANDS))[:10]
+    assert probe(s)==RANK_PREFIX
+    s.snapshot('newest-long-command-first')
+    s.send(b'\x1b[A')
+    ghost(s,RANK_LATEST,RANK_PREFIX)
+    s.send('-MANUAL\r')
+    assert (s.home/'executed').read_text()=='RANK-MANUAL\n'
+    return {'query':RANK_PREFIX,'first':RANK_LATEST,'recency':'newest first despite longer command'}
+for mode in ('vi','emacs','omz'):
+    run(f'ranking: recent longer prefix match moves from below first page to first, {mode}',mode,RANK_HISTORY,rank_prefix)
+
+def rank_boundary(s):
+    s.send('NEEDLE')
+    latest='record --with-a-long-option NEEDLE-new'
+    assert listed(s)[0][1][3:]==latest,listed(s)
+    s.send(b'\x1b[A')
+    ghost(s,latest,'NEEDLE')
+    s.send(b'\t')
+    assert probe(s)==latest and not listed(s)
+    assert not (s.home/'executed').exists()
+run('ranking: recent word-boundary match ignores match position',
+    'omz',"fc -p $HOME/rank-boundary 100\nprint -s -- 'record NEEDLE-old'\nprint -s -- 'record --with-a-long-option NEEDLE-new'\n",rank_boundary)
+
+def rank_abbreviation(s):
+    s.send('g f')
+    assert listed(s)[0][1][3:]=='git fetch recent-repo-with-longer-options',listed(s)
+    s.send(b'\x1b[A\t')
+    assert probe(s)=='git fetch recent-repo-with-longer-options' and not listed(s)
+run('ranking: recent abbreviation match uses last-use order',
+    'omz',"fc -p $HOME/rank-abbrev 100\nprint -s -- 'git fetch a'\nprint -s -- 'git fetch recent-repo-with-longer-options'\n",rank_abbreviation)
+
+def rank_levels(s):
+    s.send('record TIER')
+    assert [line[3:] for _,line in listed(s)][:3]==[
+        "echo 'record TIER-recent-substring'",'record TIER-older-prefix','record TIER'],listed(s)
+run('ranking: recent substring precedes older prefix and exact matches',
+    'omz',"fc -p $HOME/rank-tiers 100\nprint -s -- 'record TIER'\nprint -s -- 'record TIER-older-prefix'\nprint -s -- \"echo 'record TIER-recent-substring'\"\n",rank_levels)
+
+def rank_reuse(s):
+    command='record RERUN-longer-command'
+    s.send('record RERUN')
+    assert listed(s)[0][1][3:]=='record RERUN-b'
+    clean(s,command+'\r')
+    assert (s.home/'executed').read_text()=='RERUN-longer-command\n'
+    s.send('record RERUN')
+    rows=listed(s)
+    assert rows[0][1][3:]==command and len(rows)==3,rows
+    s.snapshot('reexecuted-command-promoted-once')
+    s.send(b'\x1b[B\x1b[A')
+    assert listed(s)==rows and probe(s)=='record RERUN'
+    assert (s.home/'executed').read_text()=='RERUN-longer-command\n'
+run('ranking: executing an older command promotes it without duplicates or navigation changes',
+    'omz',"fc -p $HOME/rank-rerun 100\nprint -s -- 'record RERUN-longer-command'\nprint -s -- 'record RERUN-a'\nprint -s -- 'record RERUN-b'\n",rank_reuse)
+
+def rank_recent(s):
+    s.send(RANK_PREFIX)
+    assert listed(s)[0][1][3:]==RANK_LATEST
+    clean(s,'')
+    s.send(b'\x1b[B')
+    assert listed(s)[0][1][3:]==RANK_LATEST
+run('ranking: fuzzy and empty-input menus share the same last-use order',
+    'omz',RANK_HISTORY,rank_recent)
+
+def rank_short(s):
+    s.send('ec')
+    assert listed(s)[0][1][3:]=='echo newest-longer-command',listed(s)
+run('ranking: two-character query uses the same recency preference',
+    'omz',"fc -p $HOME/rank-short 100\nprint -s -- 'echo a'\nprint -s -- 'echo newest-longer-command'\n",rank_short)
+
+# Each query demonstrates a newer non-prefix match beating an older prefix.
+for query, latest in [('g f', 'git fetch recent'), ('ab', 'record aXb'), ('ABC', 'record xABC-tail')]:
+    def rank_cross_kind(s, query=query, latest=latest):
+        s.send(query)
+        assert [line[3:] for _,line in listed(s)]==[latest,query+'-older'],listed(s)
+        s.send(b'\x1b[A\t')
+        assert probe(s)==latest and not (s.home/'executed').exists()
+    history='fc -p $HOME/cross-kind 100\n'+''.join('print -s -- '+shlex.quote(c)+'\n' for c in (query+'-older',latest))
+    run('ranking: newer abbreviation, subsequence or substring wins over prefix: '+query,
+        'omz',history,rank_cross_kind)
+
+# The short command lies between two long commands: neither long nor short gets a bonus.
+LONG_COMMANDS=['record LONG-old-'+('a'*1200),'record LONG-short','record LONG-new-'+('b'*2400)]
+LONG_HISTORY='fc -p $HOME/long-rank 100\n'+''.join('print -s -- '+shlex.quote(c)+'\n' for c in LONG_COMMANDS)
+def rank_long(s):
+    for index in (1,2,3):
+        # A non-prefix query keeps the native 2400-character gray suggestion
+        # from filling the entire screen before the menu can be shown.
+        clean(s,'LONG')
+        s.send(('\x1b'+str(index)).encode())
+        assert probe(s)==LONG_COMMANDS[-index],index
+        assert not (s.home/'executed').exists()
+    return {'lengths_in_order':[len(c) for c in reversed(LONG_COMMANDS)],'rule':'last use, independent of length'}
+run('ranking: 2400-character and 1200-character commands are equal to short commands',
+    'omz',LONG_HISTORY,rank_long)
+
+# Matching still rejects loose noise and caps only non-contiguous single-token matches.
+def rank_filter(s):
+    s.send('ab')
+    expected=['record a'+str(i)+'b' for i in range(6,2,-1)]+['record ab-old']
+    assert [line[3:] for _,line in listed(s)]==expected,listed(s)
+    s.snapshot('recent-fuzzy-cap-and-noise-filter')
+run('ranking: time-first order retains compact-subsequence cap and noise filtering',
+    'omz','fc -p $HOME/filter-rank 100\n'+''.join('print -s -- '+shlex.quote(c)+'\n' for c in
+        ['record ab-old']+['record a'+str(i)+'b' for i in range(1,7)]+['record a-too-many-characters-b']),rank_filter)
+
+# User-entered metacharacters are literal text, not a shell pattern.
+def rank_literal(s):
+    s.send('a[')
+    assert [line[3:] for _,line in listed(s)]==['record newer-a[','a[-older'],listed(s)
+run('ranking: literal pattern characters keep recent-first matching',
+    'omz',"fc -p $HOME/literal-rank 100\nprint -s -- 'a[-older'\nprint -s -- 'record newer-a['\nprint -s -- 'record irrelevant-aX'\n",rank_literal)
 
 report = {
     'plugin': PLUGIN,

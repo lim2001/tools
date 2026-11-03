@@ -187,7 +187,7 @@ def pty_start(p,interactive_install=False,legacy_options=False):
             assert time.monotonic()<deadline,bytes(raw)[-2000:]
             read(.05)
         read(.1)
-        assert probe()[1][1]=='25'
+        assert probe()[1][1]=='26'
         send('record DEMO');send(b'\x1b[B'*10)
         typed,state=probe()
         assert typed=='record DEMO' and state[0]=='11', (typed,state)

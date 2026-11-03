@@ -17,13 +17,12 @@
 # 建议在 oh-my-zsh、autosuggestions、syntax-highlighting 之后 source。
 # 从旧实验版升级请新开 shell；旧版已经覆盖的键和部件无法可靠逆推恢复。
 #
-# 匹配优先级：全词 > 前缀 > 词首 > 子串 > 缩写 > 多词 > 紧凑子序列。
-# 同级按下面的独立评分维度排序，同分按最近使用排序。
-# 追加维度：_easyCmd_dim_add name weight '代码；结果放 _easyCmd_dim_val'
+# 匹配决定是否入选；全部候选统一按最后使用顺序排列，最近使用的在前。
+# 前缀、子串和模糊匹配不分排序优先级，命令长短平权，不统计频次。
 
 [[ -o interactive && -o zle ]] || return 0
-(( ${_EASYCMD_VERSION:-0} >= 25 )) && return 0
-typeset -g _EASYCMD_VERSION=25
+(( ${_EASYCMD_VERSION:-0} >= 26 )) && return 0
+typeset -g _EASYCMD_VERSION=26
 zmodload zsh/parameter
 zmodload zsh/zleparameter
 zmodload zsh/zselect
@@ -97,8 +96,7 @@ fi
 : ${EASYCMD_FUZZY_MAX:=4}
 : ${EASYCMD_FUZZY_MIN_LEN:=2}
 : ${EASYCMD_SPAN_SLACK:=3}
-# 每级只精排最近的一批；限制逐字符路径的开销，仍可按需调大。
-: ${EASYCMD_SCORE_LIMIT:=80}
+# 限制紧凑子序列的逐字符检查数量，避免宽松匹配带来过多开销。
 : ${EASYCMD_LOOSE_LIMIT:=40}
 : ${EASYCMD_BASE_SCORE:=100000}
 typeset -ga EASYCMD_IGNORE
@@ -261,7 +259,6 @@ _easyCmd_dim_add abbrev 4000 '
 # ---- 内置维度（负分 = 惩罚项）----
 _easyCmd_dim_add span 50 '_easyCmd_dim_val=$(( - $_easyCmd_span ))'
 _easyCmd_dim_add pos  20 '_easyCmd_dim_val=$(( - $_easyCmd_first ))'
-_easyCmd_dim_add len  1  '_easyCmd_dim_val=$(( - ${#_easyCmd_cand} ))'
 
 # 候选是否为查询的完整缩写（所有查询词都被消耗掉）→ 供分级使用
 _easyCmd_is_abbrev() {
@@ -303,14 +300,12 @@ _easyCmd_score() {
 }
 
 
-# 先分级再评分；每级有独立预算，常见前缀不必跑昂贵的模糊扫描。
+# 缓存已经按最后使用顺序去重；匹配只负责筛选，直接保留这个顺序。
 _easyCmd_build() {
   emulate -L zsh
   setopt extendedglob
-  local q=$1 cand name pat text word score
-  local -i level budget idx count=0
-  local -a exact prefix boundary substr abbrev multi fuzzy group ranked tail
-  local -A seen
+  local q=$1 cand pat text
+  local -i loose_checked=0 loose_count=0
   _easyCmd_result=()
   _easyCmd_qchr=() _easyCmd_qpat=() _easyCmd_toks=() _easyCmd_hits=()
   q=${${q##[[:space:]]#}%%[[:space:]]#}
@@ -324,72 +319,26 @@ _easyCmd_build() {
   (( ${#q} >= EASYCMD_MIN_LEN && EASYCMD_MAX_SHOW > 0 )) || return 0
   [[ $q == *[[:cntrl:]]* ]] && return 0
   _easyCmd_qchr=("${(@s::)q}")
-  _easyCmd_qpat=()
   for text in "${_easyCmd_qchr[@]}"; do _easyCmd_qpat+=("${(b)text}"); done
   _easyCmd_toks=(${=q})
   _easyCmd_wm_cand=$'\0'
   pat="*${(j:*:)_easyCmd_qpat}*"
-  substr=("${(@M)_easyCmd_cache:#*${q}*}")
-  for cand in "${substr[@]}"; do
-    if [[ $cand == "$q" ]]; then exact+=("$cand")
-    elif [[ $cand == "$q"* ]]; then prefix+=("$cand")
-    elif [[ $cand == *[^[:alnum:]_.]"$q"* ]]; then boundary+=("$cand")
-    fi
-  done
-  for level in {0..6}; do
-    case $level in
-      0) group=("${exact[@]}") ;;
-      1) group=("${prefix[@]}") ;;
-      2) group=("${boundary[@]}") ;;
-      3) group=("${substr[@]}") ;;
-      4)
-        (( ${#_easyCmd_toks} > 1 )) || continue
-        group=()
-        for cand in "${_easyCmd_cache[@]}"; do
-          [[ -n ${seen[$cand]-} || $cand != ${~pat} ]] && continue
-          if _easyCmd_is_abbrev "$cand"; then group+=("$cand")
-          else multi+=("$cand"); fi
-        done ;;
-      5) group=("${multi[@]}") ;;
-      6)
-        (( ${#q} >= EASYCMD_FUZZY_MIN_LEN && EASYCMD_FUZZY_MAX > 0 )) || continue
-        group=()
-        for cand in "${_easyCmd_cache[@]}"; do
-          [[ -n ${seen[$cand]-} ]] && continue
-          [[ $cand == ${~pat} ]] && group+=("$cand")
-        done ;;
-    esac
-    budget=$EASYCMD_SCORE_LIMIT
-    (( level >= 4 || ${#q} <= 2 )) && budget=$EASYCMD_LOOSE_LIMIT
-    ranked=() tail=()
-    idx=0
-    for cand in "${group[@]}"; do
-      [[ -n ${seen[$cand]-} ]] && continue
-      # 只精排最近的一批，其余同级匹配按时间顺序保留，供继续滚动。
-      # 松散子序列仍遵守原有 FUZZY_MAX / SPAN_SLACK 限制。
-      if (( ++idx > budget )); then
-        (( level == 6 )) && break
-        tail+=("$cand")
-        continue
+  for cand in "${_easyCmd_cache[@]}"; do
+    if [[ $cand == *"$q"* ]]; then
+      _easyCmd_result+=("$cand")
+    elif [[ $cand == ${~pat} ]]; then
+      if (( ${#_easyCmd_toks} > 1 )); then
+        # 保留原有缩写、多词子序列匹配，不再按类别或得分重排。
+        _easyCmd_result+=("$cand")
+      elif (( ${#q} >= EASYCMD_FUZZY_MIN_LEN &&
+              loose_count < EASYCMD_FUZZY_MAX && ++loose_checked <= EASYCMD_LOOSE_LIMIT )); then
+        # 单词的松散子序列仍需足够紧凑；预算只限制这一类的检查和数量。
+        _easyCmd_score "$cand" || continue
+        (( _easyCmd_span <= ${#q} + EASYCMD_SPAN_SLACK )) || continue
+        _easyCmd_result+=("$cand")
+        (( ++loose_count ))
       fi
-      _easyCmd_score "$cand" || continue
-      (( level == 6 && _easyCmd_span > ${#q} + EASYCMD_SPAN_SLACK )) && continue
-      score=$_easyCmd_sc
-      # 数值排序，索引补数保证同分时最新历史优先。
-      ranked+=("$(( score * (EASYCMD_MAX_HIST + 1) + EASYCMD_MAX_HIST - idx )) $cand")
-    done
-    count=0
-    for text in "${(@On)ranked}"; do
-      cand=${text#* }
-      seen[$cand]=1
-      _easyCmd_result+=("$cand")
-      (( level == 6 && ++count >= EASYCMD_FUZZY_MAX )) && break
-    done
-    for cand in "${tail[@]}"; do
-      seen[$cand]=1
-      _easyCmd_result+=("$cand")
-    done
-    (( ${#_easyCmd_result} == ${#_easyCmd_cache} )) && return 0
+    fi
   done
   return 0
 }
