@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
-# 历史实时下拉：输入行下方最多 10 条（HIST_FUZZY_MAX_SHOW 可调小）。
-# ↑/↓ 连续滚动列表、不循环，并实时填入高亮命令；原查询保持到用户编辑为止。
-# 空输入时首次按方向键打开最近历史并填入第一项。
+# 历史实时下拉：先显示 10 条，选到第 11 条扩展至最多 20 条，再继续滚动。
+# ↑/↓ 显示灰字预览，保留用户真实输入和光标；继续打字接着原文字编辑。
+# 空输入时首次按方向键打开最近历史；原查询保持到用户编辑为止。
 # PageUp/PageDown 逐条调取较旧/较新的原生历史到输入行。
 # Tab/→ 默认保留输入行原有补全；先按 ↑/↓ 选择历史项后，Tab/→ 才填该项。
 # Alt-1..9 填当前窗口第 N 行；Ctrl-G 收起；主动选择后回车执行该项，
@@ -22,7 +22,7 @@
 # 追加维度：_hist_fuzzy_dim_add name weight '代码；结果放 _hist_fuzzy_dim_val'
 
 [[ -o interactive && -o zle ]] || return 0
-(( ${_HIST_FUZZY_VERSION:-0} >= 22 )) && return 0
+(( ${_HIST_FUZZY_VERSION:-0} >= 24 )) && return 0
 if (( ${_HIST_FUZZY_VERSION:-0} > 0 && _HIST_FUZZY_VERSION < 13 )); then
   print -u2 -- 'history_fuzzy: 请新开 zsh 加载新版，以清除旧版覆盖的部件。'
   return 1
@@ -31,7 +31,11 @@ fi
 if (( ${_HIST_FUZZY_VERSION:-0} > 0 && _HIST_FUZZY_VERSION < 20 )) && [[ $HIST_FUZZY_COLOR_HOVER == bg=cyan,fg=black ]]; then
   HIST_FUZZY_COLOR_HOVER=bg=23,fg=255
 fi
-typeset -g _HIST_FUZZY_VERSION=22
+# 热重载时把旧默认的十行上限提升到二十行；自定义较小上限仍保留。
+if (( ${_HIST_FUZZY_VERSION:-0} > 0 && _HIST_FUZZY_VERSION < 23 )) && (( ${HIST_FUZZY_MAX_SHOW:-10} == 10 )); then
+  HIST_FUZZY_MAX_SHOW=20
+fi
+typeset -g _HIST_FUZZY_VERSION=24
 zmodload zsh/parameter
 zmodload zsh/zleparameter
 zmodload zsh/zselect
@@ -39,13 +43,14 @@ zmodload zsh/datetime
 autoload -Uz add-zle-hook-widget add-zsh-hook
 
 : ${HIST_FUZZY_MAX_HIST:=10000}
-: ${HIST_FUZZY_MAX_SHOW:=10}
+: ${HIST_FUZZY_MAX_SHOW:=20}
 : ${HIST_FUZZY_MIN_LEN:=1}
 : ${HIST_FUZZY_COLOR_MATCH:=fg=green,bold}
 # 256 色深青底 #005f5f、浅色字 #eeeeee、浅绿匹配字 #afffaf。
 # 选中行两种文字的对比度分别为 6.46:1 / 6.33:1，避免绿字叠亮青底。
 : ${HIST_FUZZY_COLOR_HOVER:=bg=23,fg=255}
 : ${HIST_FUZZY_COLOR_HOVER_MATCH:=fg=157,bold}
+: ${HIST_FUZZY_COLOR_PREVIEW:=${ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE:-fg=8}}
 : ${HIST_FUZZY_FUZZY_MAX:=4}
 : ${HIST_FUZZY_FUZZY_MIN_LEN:=2}
 : ${HIST_FUZZY_SPAN_SLACK:=3}
@@ -348,13 +353,15 @@ _hist_fuzzy_build() {
 
 typeset -g _hist_fuzzy_suffix='' _hist_fuzzy_query=$'\0' _hist_fuzzy_base=main
 typeset -g _hist_fuzzy_retired_suffix=''
+typeset -g _hist_fuzzy_preview=0 _hist_fuzzy_preview_suffix='' _hist_fuzzy_retired_preview=''
+typeset -g _hist_fuzzy_saved_suggestion=''
 typeset -g _hist_fuzzy_mouse_enabled=0 _hist_fuzzy_mouse_pressed=0
 typeset -g _hist_fuzzy_mouse_buffer='' _hist_fuzzy_mouse_command=''
 typeset -g _hist_fuzzy_mouse_first=0 _hist_fuzzy_mouse_size=''
 typeset -g _hist_fuzzy_pinned=0 _hist_fuzzy_pinned_buffer=''
 typeset -g _hist_fuzzy_recent=0
 typeset -g _hist_fuzzy_suppressed='' _hist_fuzzy_closed=0 _hist_fuzzy_hover=1
-typeset -g _hist_fuzzy_top=1
+typeset -g _hist_fuzzy_top=1 _hist_fuzzy_expanded=0
 typeset -g _hist_fuzzy_engaged=0 _hist_fuzzy_selection_cursor=0
 typeset -g _hist_fuzzy_busy=0 _hist_fuzzy_active=0
 typeset -ga _hist_fuzzy_shown=()
@@ -364,11 +371,21 @@ typeset -gA _hist_fuzzy_maps=()
 # 只摘掉自己的后缀和高亮；autosuggestions 异步替换 POSTDISPLAY 时不回写旧建议。
 _hist_fuzzy_detach() {
   local entry
+  local -i preview_drawn=0
   local -a keep=()
   local -A owned=()
   if [[ -n $_hist_fuzzy_suffix && $POSTDISPLAY == *"$_hist_fuzzy_suffix" ]]; then
     POSTDISPLAY=${POSTDISPLAY%"$_hist_fuzzy_suffix"}
+    (( _hist_fuzzy_preview )) && preview_drawn=1
   fi
+  if { (( preview_drawn )) || [[ -n $_hist_fuzzy_preview_suffix ]]; } &&
+      [[ $POSTDISPLAY == "$_hist_fuzzy_preview_suffix" ]]; then
+    POSTDISPLAY=''
+    # 委托原生编辑/收起时恢复原来的建议；候选灰字绝不交给原生接受部件。
+    [[ $BUFFER == "$_hist_fuzzy_pinned_buffer" ]] && POSTDISPLAY=$_hist_fuzzy_saved_suggestion
+  fi
+  [[ -n $_hist_fuzzy_preview_suffix ]] && _hist_fuzzy_retired_preview=$_hist_fuzzy_preview_suffix
+  _hist_fuzzy_preview_suffix=''
   [[ -n $_hist_fuzzy_suffix ]] && _hist_fuzzy_retired_suffix=$_hist_fuzzy_suffix
   _hist_fuzzy_suffix=''
   for entry in "${_hist_fuzzy_highlights[@]}"; do owned[$entry]=1; done
@@ -380,12 +397,26 @@ _hist_fuzzy_detach() {
   return 0
 }
 
+# 前缀匹配只预览未输入部分；模糊匹配另显完整候选，不改写真实文字。
+# 调用方用局部 REPLY 接收，供屏幕高度计算与实际绘制使用同一段文本。
+_hist_fuzzy_preview_text() {
+  local command=$_hist_fuzzy_result[_hist_fuzzy_hover]
+  if [[ $command == "$BUFFER"* ]]; then
+    REPLY=${command#"$BUFFER"}
+  else
+    REPLY="  → $command"
+  fi
+}
+
 _hist_fuzzy_update() {
   emulate -L zsh
   # 翻页键调取历史时，建议插件的中间重绘也保持列表收起。
   (( ${_hist_fuzzy_history_browsing:-0} )) && { _hist_fuzzy_shown=(); return 0; }
-  # 方向键和鼠标填入不改变查询及其高亮；用户修改文字后才重新搜索。
-  [[ $BUFFER == "$_hist_fuzzy_pinned_buffer" ]] || _hist_fuzzy_pinned=0
+  # 预览及鼠标填入都保留原查询；真实文字变化后重新搜索。
+  if [[ $BUFFER != "$_hist_fuzzy_pinned_buffer" ]]; then
+    _hist_fuzzy_pinned=0
+    _hist_fuzzy_preview=0
+  fi
   if (( _hist_fuzzy_recent && ! _hist_fuzzy_pinned )) && [[ -n $BUFFER ]]; then
     _hist_fuzzy_recent=0
     _hist_fuzzy_query=$'\0'
@@ -399,18 +430,25 @@ _hist_fuzzy_update() {
     _hist_fuzzy_build "$BUFFER"
     _hist_fuzzy_hover=1
     _hist_fuzzy_top=1
+    _hist_fuzzy_expanded=0
     _hist_fuzzy_engaged=0
   fi
   # 光标回到输入行编辑后，Tab/→ 恢复原生含义；探针/重绘不改变选择。
   (( CURSOR != _hist_fuzzy_selection_cursor )) && _hist_fuzzy_engaged=0
   if (( ! ${#_hist_fuzzy_result} )); then _hist_fuzzy_shown=(); return 0; fi
-  local part
-  local -i n=$(( LINES - 3 ))
-  for part in "${(@f)${:-"$BUFFER$POSTDISPLAY"}}"; do
+  local part REPLY display="$BUFFER$POSTDISPLAY"
+  if (( _hist_fuzzy_preview )); then
+    _hist_fuzzy_preview_text
+    display="$BUFFER$REPLY"
+  fi
+  local -i n=$(( LINES - 3 )) limit=10
+  (( _hist_fuzzy_hover > 10 )) && _hist_fuzzy_expanded=1
+  (( _hist_fuzzy_expanded )) && limit=20
+  for part in "${(@f)display}"; do
     (( n -= ${(m)#part} / (COLUMNS > 0 ? COLUMNS : 80) + 1 ))
   done
   (( n > HIST_FUZZY_MAX_SHOW )) && n=$HIST_FUZZY_MAX_SHOW
-  (( n > 10 )) && n=10
+  (( n > limit )) && n=$limit
   (( n > ${#_hist_fuzzy_result} )) && n=${#_hist_fuzzy_result}
   if (( n < 1 || COLUMNS < 8 )); then _hist_fuzzy_shown=(); return 0; fi
   (( _hist_fuzzy_hover > ${#_hist_fuzzy_result} )) && _hist_fuzzy_hover=${#_hist_fuzzy_result}
@@ -435,13 +473,20 @@ _hist_fuzzy_compose() {
   (( PENDING || KEYS_QUEUED_COUNT )) && return 0
   _hist_fuzzy_update
   (( ${#_hist_fuzzy_shown} )) || { _hist_fuzzy_mouse_off; return 0; }
-  local line row colour number
+  local line row colour number REPLY
   # 旧版 ZLE 遇到重复 fg 会停止解析；先移除选中行前景，再设置匹配字颜色。
   local -a hover_match_base=("${(@s:,:)HIST_FUZZY_COLOR_HOVER}")
   [[ ,$HIST_FUZZY_COLOR_HOVER_MATCH, == *,fg=*,* ]] &&
     hover_match_base=("${(@)hover_match_base:#fg=*}")
   local hover_match="${(j:,:)hover_match_base},$HIST_FUZZY_COLOR_HOVER_MATCH"
   local -i i=0 index off pos limit=$(( COLUMNS - 1 )) start=${#region_highlight} run end digits prefix
+  if (( _hist_fuzzy_preview )); then
+    # 只使用 POSTDISPLAY 绘制灰字；在委托原生部件前会摘除，绝不被当成输入。
+    _hist_fuzzy_preview_text
+    _hist_fuzzy_preview_suffix=$REPLY
+    POSTDISPLAY=$_hist_fuzzy_preview_suffix
+    region_highlight+=("${#BUFFER} $(( ${#BUFFER} + ${#POSTDISPLAY} )) $HIST_FUZZY_COLOR_PREVIEW, memo=history-fuzzy")
+  fi
   number=$(( _hist_fuzzy_top + ${#_hist_fuzzy_shown} - 1 ))
   digits=${#number}
   (( digits < 2 )) && digits=2
@@ -485,6 +530,8 @@ _hist_fuzzy_compose() {
 }
 
 _hist_fuzzy_dismiss() {
+  _hist_fuzzy_preview=0
+  _hist_fuzzy_expanded=0
   _hist_fuzzy_pinned=0
   _hist_fuzzy_recent=0
   _hist_fuzzy_mouse_off
@@ -508,6 +555,15 @@ _hist_fuzzy_call() {
   shift
   local -i completion=0
   _hist_fuzzy_detach
+  # 清空/删除在空 BUFFER 上也应退出预览，不能随后回车执行被清掉的灰字。
+  if (( _hist_fuzzy_preview )) && [[ $original == *self-insert* || $original == *delete* ||
+      $original == *kill* || $original == *paste* ]]; then
+    _hist_fuzzy_preview=0
+    _hist_fuzzy_pinned=0
+    _hist_fuzzy_recent=0
+    _hist_fuzzy_engaged=0
+    _hist_fuzzy_query=$'\0'
+  fi
   [[ $original == *complete* || $original == *expand* || $original == *list-choices* ||
      ${widgets[$original]-} == completion:* ]] && completion=1
   (( completion )) && _hist_fuzzy_dismiss
@@ -522,9 +578,11 @@ _hist_fuzzy_call() {
     # 连续输入可能跳过中间帧；即使后续退格把文字恢复原样，编辑也应退出列表选择。
     if [[ $BUFFER != "$hf_before_buffer" ]] || (( CURSOR != hf_before_cursor )); then
       _hist_fuzzy_engaged=0
+      _hist_fuzzy_preview=0
     fi
     if [[ $BUFFER != "$hf_before_buffer" ]]; then
       _hist_fuzzy_pinned=0
+      _hist_fuzzy_preview=0
       if (( _hist_fuzzy_recent )); then
         _hist_fuzzy_recent=0
         _hist_fuzzy_query=$'\0'
@@ -547,7 +605,7 @@ _hist_fuzzy_key() {
   local -i idx opening=0
   _hist_fuzzy_detach
   if [[ $action == up || $action == down ]]; then
-    if (( _hist_fuzzy_closed )) || { [[ -z $BUFFER ]] && (( ! _hist_fuzzy_recent )); }; then
+    if (( _hist_fuzzy_closed )) || { [[ -z $BUFFER ]] && (( ! _hist_fuzzy_recent && ! _hist_fuzzy_pinned )); }; then
       [[ -z $BUFFER ]] && _hist_fuzzy_recent=1
       _hist_fuzzy_closed=0
       _hist_fuzzy_query=$'\0'
@@ -567,9 +625,9 @@ _hist_fuzzy_key() {
             (( _hist_fuzzy_hover < ${#_hist_fuzzy_result} )) && (( ++_hist_fuzzy_hover ))
           fi
         fi
-        BUFFER=$_hist_fuzzy_result[_hist_fuzzy_hover]
-        CURSOR=${#BUFFER}
-        POSTDISPLAY=''
+        # 方向键只改选择；真实文字及编辑位置始终保留，灰字由 POSTDISPLAY 绘制。
+        (( _hist_fuzzy_preview )) || _hist_fuzzy_saved_suggestion=$POSTDISPLAY
+        _hist_fuzzy_preview=1
         _hist_fuzzy_pinned=1
         _hist_fuzzy_pinned_buffer=$BUFFER
         _hist_fuzzy_engaged=1
@@ -762,6 +820,7 @@ _hist_fuzzy_mouse() {
          [[ $BUFFER == "$_hist_fuzzy_mouse_buffer" && $hf_command == "$_hist_fuzzy_mouse_command" &&
             $_hist_fuzzy_mouse_size == "$hf_height $hf_width" ]]; then
       _hist_fuzzy_detach
+      _hist_fuzzy_preview=0
       BUFFER=$hf_command
       CURSOR=${#BUFFER}
       POSTDISPLAY=''
@@ -819,6 +878,11 @@ _hist_fuzzy_make_map() {
 }
 
 _hist_fuzzy_init() {
+  _hist_fuzzy_preview=0
+  _hist_fuzzy_preview_suffix=''
+  _hist_fuzzy_retired_preview=''
+  _hist_fuzzy_saved_suggestion=''
+  _hist_fuzzy_expanded=0
   _hist_fuzzy_pinned=0
   _hist_fuzzy_recent=0
   _hist_fuzzy_active=1
@@ -841,6 +905,7 @@ _hist_fuzzy_select() {
       [[ -n ${_hist_fuzzy_maps[$KEYMAP]-} ]] || _hist_fuzzy_make_map "$KEYMAP"
       zle -K "${_hist_fuzzy_maps[$KEYMAP]}" ;;
     vicmd)
+      _hist_fuzzy_preview=0
       _hist_fuzzy_pinned=0
       (( _hist_fuzzy_recent )) && _hist_fuzzy_query=$'\0'
       _hist_fuzzy_recent=0
@@ -852,12 +917,13 @@ _hist_fuzzy_select() {
       [[ -n ${_hist_fuzzy_maps[vicmd]-} ]] || _hist_fuzzy_make_map vicmd
       zle -K "${_hist_fuzzy_maps[vicmd]}" ;;
     hf-map-*) ;;
-    *) _hist_fuzzy_mouse_off; _hist_fuzzy_detach; _hist_fuzzy_shown=(); _hist_fuzzy_engaged=0 ;;
+    *) _hist_fuzzy_preview=0; _hist_fuzzy_mouse_off; _hist_fuzzy_detach; _hist_fuzzy_shown=(); _hist_fuzzy_engaged=0 ;;
   esac
   return 0
 }
 
 _hist_fuzzy_finish() {
+  _hist_fuzzy_preview=0
   _hist_fuzzy_pinned=0
   _hist_fuzzy_recent=0
   _hist_fuzzy_mouse_off
@@ -876,6 +942,7 @@ _hist_fuzzy_suggest_highlight() {
   if [[ ( $_hist_fuzzy_base == vicmd || ( $KEYMAP != hf-map-* && $KEYMAP != "$_hist_fuzzy_base" ) ) &&
         -n $_hist_fuzzy_retired_suffix && $POSTDISPLAY == *"$_hist_fuzzy_retired_suffix" ]]; then
     POSTDISPLAY=${POSTDISPLAY%"$_hist_fuzzy_retired_suffix"}
+    [[ -n $_hist_fuzzy_retired_preview && $POSTDISPLAY == "$_hist_fuzzy_retired_preview" ]] && POSTDISPLAY=''
   fi
   _hist_fuzzy_original_suggest_highlight "$@"
   if (( _hist_fuzzy_active && _hist_fuzzy_busy != 1 )) && [[ $_hist_fuzzy_base != vicmd && ( $KEYMAP == hf-map-* || $KEYMAP == "$_hist_fuzzy_base" ) ]]; then
@@ -885,6 +952,8 @@ _hist_fuzzy_suggest_highlight() {
 }
 
 _hist_fuzzy_precmd() {
+  _hist_fuzzy_preview=0
+  _hist_fuzzy_preview_suffix=''
   _hist_fuzzy_pinned=0
   _hist_fuzzy_recent=0
   _hist_fuzzy_mouse_off

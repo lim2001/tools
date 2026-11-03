@@ -5,6 +5,8 @@ Run: python3 assist/tests/history_fuzzy_pty.py
 Optional: --omz /path/to/oh-my-zsh --plugin /path/to/history_fuzzy.zsh
 Use --mouse-only for mouse cases, --focused for native keys/Enter,
 and --history-only for empty-input menus and PageUp/PageDown.
+Use --preview-only for gray previews and 10-to-20-row expansion,
+or --preserve-only for editing existing input after arrow navigation.
 Each child uses an empty environment, a fresh HOME and a private plugin copy.
 Only synthetic history is loaded. The PTY and terminal emulator share dimensions.
 CPR replies come from the emulator's cursor, with separate no-response cases.
@@ -52,6 +54,8 @@ def contrast(fg, bg):
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--plugin', type=Path, default=Path(__file__).resolve().parents[1] / 'history_fuzzy.zsh')
 parser.add_argument('--omz', type=Path, default=Path.home() / '.oh-my-zsh')
+parser.add_argument('--preserve-only', action='store_true', help='only original input preservation regressions')
+parser.add_argument('--preview-only', action='store_true', help='only gray preview and 10-to-20 row expansion cases')
 parser.add_argument('--scroll-only', action='store_true', help='only scrolling and live input selection cases')
 parser.add_argument('--history-only', action='store_true', help='only empty-input menu and PageUp/PageDown cases')
 parser.add_argument('--mouse-only', action='store_true', help='only automatic mouse regressions')
@@ -203,6 +207,7 @@ add-zle-hook-widget line-init _hf_test_ready
     def snapshot(self, label):
         result = {"label": label, "cursor": [self.screen.cursor.y, self.screen.cursor.x],
                   "lines": self.screen.display,
+                  "cursor_line_foregrounds": [self.screen.buffer[self.screen.cursor.y][x].fg for x in range(self.cols)],
                   "selection_styles": sorted({(cell.fg, cell.bg)
                                               for row in self.screen.buffer.values()
                                               for cell in row.values() if cell.bg == HOVER_BG}),
@@ -349,12 +354,13 @@ def exercise(mode, cols):
             check_hover(s, idx)
             assert listed(s) == before, 'candidate list moved before scrolling was needed'
             expected = before[idx-1][1][3:]
-            assert probe(s) == expected
-            assert s.screen.cursor.y == cursor[0]
-            assert s.screen.cursor.x == 4 + len(expected)
+            assert probe(s) == 'record MANUAL'
+            assert (s.screen.cursor.y, s.screen.cursor.x) == cursor
+            assert s.screen.display[s.screen.cursor.y].rstrip() == 'hf> '+expected
+            assert s.screen.buffer[s.screen.cursor.y][4+len('record MANUAL')].fg in ('brightblack','808080')
             assert b'\x1b[2J' not in raw and b'\n' not in raw, 'hover cleared/scrolled screen'
         s.snapshot('hover')
-        checks.append('CSI arrows fill selected input; dark teal full row; contrast >= 4.5:1; stable list before window scroll')
+        checks.append('CSI arrows preview gray suffix while preserving typed BUFFER and cursor; stable list and readable selection')
         for key, idx in [(b'\x1bOB',2),(b'\x1bOA',1)]:
             s.send(key, .12)
             check_hover(s, idx)
@@ -454,7 +460,7 @@ def exercise(mode, cols):
 
 
 matrix=[]
-for mode in (() if args.focused or args.mouse_only or args.history_only or args.scroll_only else ('vi','emacs','omz')):
+for mode in (() if args.focused or args.mouse_only or args.history_only or args.scroll_only or args.preview_only or args.preserve_only else ('vi','emacs','omz')):
     for cols in (80,100):
         result=exercise(mode,cols)
         matrix.append(result)
@@ -462,6 +468,10 @@ for mode in (() if args.focused or args.mouse_only or args.history_only or args.
 
 edge_results=[]
 def run(name, mode, extra, test, cols=100, rows=24, cpr=True):
+    if args.preserve_only and not name.startswith('preview: preserve'):
+        return
+    if args.preview_only and not name.startswith('preview:'):
+        return
     if args.scroll_only and not name.startswith('scroll:'):
         return
     if args.history_only and not name.startswith('history keys:'):
@@ -491,10 +501,10 @@ def fifteen(s):
     s.send('record MANUAL');assert len(listed(s))==10
     s.send(b'\x1b[A');assert s.snapshot('top-stop')['selected_rows']==[listed(s)[0][0]]
     s.send(b'\x1b[B'*20)
-    assert len(listed(s))==10 and listed(s)[-1][1].startswith('15 ')
-    assert probe(s)=='record MANUAL-01'
+    assert len(listed(s))==15 and listed(s)[-1][1].startswith('15 ')
+    assert probe(s)=='record MANUAL'
     assert s.snapshot('bottom-stop')['selected_rows']==[listed(s)[-1][0]]
-run('15 results scroll in a maximum ten-row window without wrapping','omz','HIST_FUZZY_MAX_SHOW=15\n',fifteen)
+run('15 results start with ten, expand to configured limit, and stop at ends','omz','HIST_FUZZY_MAX_SHOW=15\n',fifteen)
 
 def resize(s):
     s.send('record MANUAL');assert len(listed(s))==10
@@ -505,7 +515,8 @@ def resize(s):
         assert 0 < len(listed(s)) <= min(10,rows-4), listed(s)
         selected=s.snapshot(f'resize-{cols}x{rows}')['selected_rows']
         assert len(selected)==1,selected
-        assert s.screen.display[selected[0]].rstrip().endswith(b), b
+        assert b=='record MANUAL' and s.screen.cursor.x==4+len(b)
+        assert s.screen.display[s.screen.cursor.y].rstrip()[4:]==s.screen.display[selected[0]].rstrip()[3:]
         assert all(s.screen.buffer[selected[0]][x].bg==HOVER_BG for x in range(cols-1))
 run('terminal resize','omz','',resize)
 
@@ -693,20 +704,21 @@ def explicit_selection(s):
     # Moving the input cursor cancels list ownership, even without changing BUFFER.
     clean(s,query)
     s.send(b'\x1b[B\x1b[D\x1b[C')
-    chosen=query+'-medium'
-    assert probe(s)==chosen
-    assert int((s.home/'state').read_text().split()[0])==len(chosen)
+    assert probe(s)==query
+    assert int((s.home/'state').read_text().split()[0])==len(query)
     s.send(b'\x1b[C')
-    assert probe(s)==chosen
-    # Typing a new character and dismissing also return the keys to the input row.
+    assert probe(s)==grey
+    # Typing edits the original input; dismissal also restores native gray acceptance.
     for sequence in (b'\x1b[B-',b'\x1b[B\x07'):
         clean(s,query)
         s.send(sequence)
         s.send(b'\t')
-        assert probe(s)==chosen+('-' if sequence.endswith(b'-') else '')
+        assert probe(s)==grey
     clean(s,query)
-    s.send(b'\x1b[BX\x7f\t')
-    assert probe(s)==chosen  # An edit followed by undoing it still relinquishes list selection.
+    s.send(b'\x1b[BX\x7f')
+    assert probe(s)==query and listed(s)
+    s.send(b'\t')
+    assert probe(s)==grey
     clean(s,query)
     s.send(b'\x1b1')
     assert probe(s)==query+'-s'
@@ -733,7 +745,7 @@ def cd_selected(s, enter=b'\r'):
     rows=listed(s)
     assert len(rows)==10 and rows[8][1]=='09 cd disk/rk3588',rows
     s.send(b'\x1b[B'*8)
-    assert probe(s)=='cd disk/rk3588'  # Keyboard selection is shown in the input immediately.
+    assert probe(s)=='cd disk'  # Keep the typed prefix until explicitly accepted.
     selected=s.snapshot('selected-item-09')
     assert selected['selected_rows']==[rows[8][0]],selected
     s.send(enter,.3)
@@ -759,9 +771,9 @@ def enter_without_selection(s):
     cases=(b'',b'\x1b[BX\x7f',b'\x1b[B\x1b[D\x1b[C',b'\x1b[B\x07')
     for sequence in cases:
         clean(s,'record MANUAL')
-        expected=listed(s)[1][1][3:] if sequence else 'record MANUAL'
+        expected='record MANUAL'
         s.send(sequence+b'\r')
-        executed+=expected.removeprefix('record ')+'\n'
+        if expected: executed+=expected.removeprefix('record ')+'\n'
         assert (s.home/'executed').read_text()==executed,(sequence,(s.home/'executed').read_text())
         assert not listed(s)
     return {'cases':['no selection','cancelled edit','cursor movement','Ctrl-G'],
@@ -935,7 +947,7 @@ def mouse_edit(s):
         s.mouse(y=y)
         s.send(edit+mouse_report(y=y,release=True).encode())
         assert not (s.home/'executed').exists()
-        assert probe(s)==(rows[9][1][3:] if edit==b'\x1b[B' else 'record MANUAL')
+        assert probe(s)=='record MANUAL'
     rows=mouse_rows(s)
     y=rows[8][0]+1
     s.mouse(y=y)
@@ -1149,7 +1161,7 @@ def recent_menu(s):
     for opening in (b'\x1b[A', b'\x1b[B', b'\x1bOA', b'\x1bOB'):
         clean(s, '')
         s.send(opening)
-        assert probe(s) == RECENT_COMMANDS[-1]
+        assert probe(s) == ''
         recent_selected(s, 1)
         before = listed(s)
         cursor_row = s.screen.cursor.y
@@ -1159,9 +1171,9 @@ def recent_menu(s):
             assert listed(s) == before
             assert s.screen.cursor.y == cursor_row
             assert b'\n' not in raw and b'\x1b[2J' not in raw
-            assert probe(s) == RECENT_COMMANDS[-index]
+            assert probe(s) == ''
         s.send(b'\x07')
-        assert probe(s) == RECENT_COMMANDS[-2] and not listed(s)
+        assert probe(s) == '' and not listed(s)
         mouse_closed(s)
     clean(s, '')
     s.send(b'\x1b[B\x1b[B\r')
@@ -1190,7 +1202,7 @@ def recent_transitions(s):
     s.send(b'\x1b[B')
     recent_selected(s, 1)
     s.send(b'X\x7f')
-    assert probe(s) == RECENT_COMMANDS[-1] and len(listed(s)) == 1
+    assert probe(s) == '' and not listed(s)
     s.send(b'\x1b[A\t')
     assert probe(s) == RECENT_COMMANDS[-1] and not listed(s)
     assert not (s.home/'executed').exists()
@@ -1200,19 +1212,19 @@ def recent_transitions(s):
         assert probe(s) == 'zzzzNoMatch' and not listed(s)
     clean(s, '')
     s.send(b'\x1b[A\x07\x1b[B')
-    assert probe(s) == RECENT_COMMANDS[-1] and len(listed(s)) == 1
+    assert probe(s) == '' and len(listed(s)) == 10
     s.send(b'\x03')
     assert probe(s) == '' and not listed(s)
     mouse_closed(s)
     s.send(b'\x1b[A')
     recent_selected(s, 1)
     s.send(b'\x1b', .3)
-    assert probe(s) == RECENT_COMMANDS[-1] and not listed(s)
+    assert probe(s) == '' and not listed(s)
     mouse_closed(s)
     s.send('i')
-    assert probe(s) == RECENT_COMMANDS[-1] and len(listed(s)) == 1
+    assert probe(s) == '' and not listed(s)
     s.send(b'\x1b[B')
-    assert probe(s) == RECENT_COMMANDS[-1] and len(listed(s)) == 1
+    assert probe(s) == '' and len(listed(s)) == 10
 run('history keys: edit changes recent menu to fuzzy search; empty/no match never recalls native history',
     'omz', RECENT_HISTORY, recent_transitions)
 
@@ -1307,18 +1319,19 @@ SCROLL_COMMANDS = [f'record SCROLL-{n:02d}' for n in range(1, 36)]
 SCROLL_HISTORY = 'fc -p $HOME/scroll-history 200\n' + ''.join(
     'print -s -- ' + shlex.quote(cmd) + '\n' for cmd in SCROLL_COMMANDS)
 
-def scroll_state(s, index, first, commands=SCROLL_COMMANDS, fuzzy=False):
+def scroll_state(s, index, first, commands=SCROLL_COMMANDS, fuzzy=False, committed=False):
     rows = listed(s)
     expected = list(reversed(commands))
-    assert len(rows) == 10, rows
-    assert [int(line.split(' ', 1)[0]) for _, line in rows] == list(range(first, first+10)), rows
-    assert [line.split(' ', 1)[1] for _, line in rows] == expected[first-1:first+9], rows
-    assert probe(s) == expected[index-1]
+    assert len(rows) == 20, rows
+    assert [int(line.split(' ', 1)[0]) for _, line in rows] == list(range(first, first+20)), rows
+    assert [line.split(' ', 1)[1] for _, line in rows] == expected[first-1:first+19], rows
+    actual = expected[index-1] if committed else ('record SCROLL' if fuzzy else '')
+    assert probe(s) == actual
     y = rows[index-first][0]
     shot = s.snapshot(f'scroll-{index}-from-{first}')
     assert shot['selected_rows'] == [y], shot
     assert all(s.screen.buffer[y][x].bg == HOVER_BG for x in range(s.cols-1))
-    assert s.screen.cursor.x == 4 + len(expected[index-1])
+    assert s.screen.cursor.x == 4 + len(actual)
     assert s.screen.display[s.screen.cursor.y].rstrip() == 'hf> '+expected[index-1]
     if fuzzy:
         assert s.screen.buffer[y][3].fg == HOVER_MATCH
@@ -1328,92 +1341,63 @@ def scroll_state(s, index, first, commands=SCROLL_COMMANDS, fuzzy=False):
         assert all(s.screen.buffer[y][x].fg == HOVER_FG for x in range(len(rows[index-first][1])))
     return rows
 
-def scroll_recent(s):
-    assert probe(s) == '' and not listed(s)
-    s.send(b'\x1b[B')
-    scroll_state(s, 1, 1)
-    s.send(b'\x1b[A')
-    scroll_state(s, 1, 1)
-    s.send(b'\x1b[B'*9)
-    scroll_state(s, 10, 1)
-    for index in (11, 12):
-        raw = s.send(b'\x1b[B')
-        scroll_state(s, index, index-9)
-        assert b'\x1b[2J' not in raw and b'\n' not in raw
-    s.send(b'\x1b[A')
-    scroll_state(s, 11, 3)
-    s.send(b'\x1b[A'*12)
-    scroll_state(s, 1, 1)
-    s.send(b'\x1b[B'*37)
-    scroll_state(s, 35, 26)
-    assert not (s.home/'executed').exists()
-    s.send(b'\x1b[A\r')
-    assert (s.home/'executed').read_text() == 'SCROLL-02\n'
-    assert probe(s) == '' and not listed(s)
-    mouse_closed(s)
-
-for mode in ('vi', 'emacs', 'omz'):
-    for cols in (80, 100):
-        run(f'scroll: recent history crosses 10/11/12, stops at ends, fills input; {mode}, {cols}',
-            mode, SCROLL_HISTORY, scroll_recent, cols=cols)
-
 def scroll_fuzzy(s):
     s.send('record SCROLL')
     assert probe(s) == 'record SCROLL'
     original = listed(s)
     s.send(b'\x1b[B'*11)
-    scroll_state(s, 12, 3, fuzzy=True)
-    # Filled input does not replace the original query or reduce its candidates.
-    assert [line[3:] for _, line in listed(s)][:8] == [line[3:] for _, line in original][2:]
+    scroll_state(s, 12, 1, fuzzy=True)
+    # Preview does not replace the original query or reduce its candidates.
+    assert listed(s)[:10] == original
     s.send(b'\x1b[B'*30)
-    scroll_state(s, 35, 26, fuzzy=True)
+    scroll_state(s, 35, 16, fuzzy=True)
     s.send(b'\x1b[A'*40)
     scroll_state(s, 1, 1, fuzzy=True)
     s.send('-EDITED')
-    assert probe(s) == SCROLL_COMMANDS[-1]+'-EDITED' and not listed(s)
+    assert probe(s) == 'record SCROLL-EDITED' and not listed(s)
     s.send(b'\r')
-    assert (s.home/'executed').read_text() == 'SCROLL-35-EDITED\n'
+    assert (s.home/'executed').read_text() == 'SCROLL-EDITED\n'
 run('scroll: fuzzy query stays fixed while navigating; editing searches again',
     'omz', SCROLL_HISTORY, scroll_fuzzy)
 
 def scroll_mouse_alt(s):
     s.send(b'\x1b[B'*12)
-    entries = scroll_state(s, 12, 3)
+    entries = scroll_state(s, 12, 1)
     for relative in (7, 2):
         row = listed(s)[relative-1][0]+1
         s.mouse(y=row); s.mouse(y=row,release=True)
-        scroll_state(s, relative+2, 3)
+        scroll_state(s, relative, 1, committed=True)
         assert listed(s) == entries
         assert not (s.home/'executed').exists()
     s.send(b'\x1b1')
-    assert probe(s) == SCROLL_COMMANDS[-3] and not listed(s)
+    assert probe(s) == SCROLL_COMMANDS[-1] and not listed(s)
     assert not (s.home/'executed').exists()
     s.send(b'\r')
-    assert (s.home/'executed').read_text() == 'SCROLL-33\n'
+    assert (s.home/'executed').read_text() == 'SCROLL-35\n'
 run('scroll: mouse reselects visible commands and Alt-1 fills first visible row',
     'omz', SCROLL_HISTORY, scroll_mouse_alt)
 
 def scroll_history_keys(s):
     s.send(b'\x1b[B'*12)
-    scroll_state(s, 12, 3)
+    scroll_state(s, 12, 1)
     s.send(b'\x07')
-    assert probe(s) == 'record SCROLL-24' and not listed(s)
+    assert probe(s) == '' and not listed(s)
     mouse_closed(s)
     s.send(b'\x1b[5~')
     assert probe(s) == 'record SCROLL-35' and not listed(s)
     s.send(b'\x1b[6~')
-    assert probe(s) == 'record SCROLL-24' and not listed(s)
+    assert probe(s) == '' and not listed(s)
     s.send(b'\x03')
     assert probe(s) == '' and not listed(s)
     assert not (s.home/'executed').exists()
-run('scroll: Ctrl-G keeps live input, PageUp/PageDown still navigate native history, Ctrl-C cancels',
+run('scroll: Ctrl-G clears preview, PageUp/PageDown still navigate native history, Ctrl-C cancels',
     'omz', SCROLL_HISTORY, scroll_history_keys)
 
 def scroll_beyond_ranking_budget(s):
     commands = [f'record SCROLL-{n:02d}' for n in range(1, 91)]
     s.send('record SCROLL')
     s.send(b'\x1b[B'*84)
-    scroll_state(s, 85, 76, commands, fuzzy=True)
+    scroll_state(s, 85, 66, commands, fuzzy=True)
     assert not (s.home/'executed').exists()
 run('scroll: fuzzy results continue beyond the scoring batch without losing matches',
     'omz', 'fc -p $HOME/scroll-budget 200\nfor n in {01..90}; do print -s -- "record SCROLL-$n"; done\n',
@@ -1422,19 +1406,295 @@ run('scroll: fuzzy results continue beyond the scoring batch without losing matc
 def scroll_long(s):
     command = 'record '+ '中文路径'*20
     s.send(b'\x1b[B')
-    assert probe(s) == command
+    assert probe(s) == ''
     rows = listed(s)
     assert len(rows) == 5 and rows[0][1].endswith('…'), rows
+    visible=''.join(s.screen.display[y].rstrip() for y in range(s.screen.cursor.y,rows[0][0]))
+    assert visible == 'hf> '+command, visible
     assert s.snapshot('long-live-input')['selected_rows'] == [rows[0][0]]
     s.send(b'\x1b[B'*11)
-    assert probe(s) == 'record SCROLL-25'
+    assert probe(s) == ''
+    assert s.screen.display[s.screen.cursor.y].rstrip()=='hf> record SCROLL-25'
     assert [int(line.split(' ',1)[0]) for _,line in listed(s)] == list(range(8,13))
     assert s.snapshot('short-after-long')['selected_rows'] == [listed(s)[-1][0]]
     assert not (s.home/'executed').exists()
     s.send(b'\x03')
     assert probe(s) == '' and not listed(s)
-run('scroll: live input keeps full Unicode command and honors smaller window size',
+run('scroll: gray preview keeps full Unicode command and honors smaller window size',
     'omz', SCROLL_HISTORY + "HIST_FUZZY_MAX_SHOW=5\nprint -s -- 'record "+'中文路径'*20+"'\n", scroll_long, cols=80)
+
+def ghost(s, command, typed='', cursor=None):
+    cursor = len(typed) if cursor is None else cursor
+    assert probe(s) == typed, 'preview changed the editable BUFFER'
+    assert int((s.home/'state').read_text().split()[0]) == cursor
+    y = s.screen.cursor.y
+    assert s.screen.cursor.x == 4+cursor
+    suffix = command[len(typed):] if command.startswith(typed) else '  → '+command
+    assert s.screen.display[y].rstrip() == ('hf> '+typed+suffix).rstrip()
+    assert all(s.screen.buffer[y][x].fg in ('brightblack','808080')
+               for x in range(4+len(typed),4+len(typed+suffix))), 'preview is not gray'
+
+def preview_state(s, index, first, count, typed=''):
+    rows = listed(s)
+    assert len(rows) == count, rows
+    assert [int(line.split(' ',1)[0]) for _,line in rows] == list(range(first,first+count))
+    assert [line[3:] for _,line in rows] == list(reversed(SCROLL_COMMANDS))[first-1:first+count-1]
+    ghost(s,SCROLL_COMMANDS[-index],typed)
+    y = rows[index-first][0]
+    assert s.snapshot(f'gray-{index}-rows-{count}')['selected_rows'] == [y]
+    assert all(s.screen.buffer[y][x].bg == HOVER_BG for x in range(s.cols-1))
+
+def preview_expand(s):
+    assert probe(s)=='' and not listed(s)
+    s.send(b'\x1b[B')
+    preview_state(s,1,1,10)
+    s.send(b'\x1b[A')
+    preview_state(s,1,1,10)
+    s.send(b'\x1b[B'*9)
+    preview_state(s,10,1,10)
+    s.send(b'\x1b[B')
+    preview_state(s,11,1,20)
+    s.send(b'\x1b[B'*9)
+    preview_state(s,20,1,20)
+    raw=s.send(b'\x1b[B')
+    preview_state(s,21,2,20)
+    assert b'\x1b[2J' not in raw and b'\n' not in raw
+    s.send(b'\x1b[A'*30)
+    preview_state(s,1,1,20)
+    s.send(b'\x1b[B'*40)
+    preview_state(s,35,16,20)
+    assert not (s.home/'executed').exists()
+    # A new manually typed command starts at column zero, and only it executes.
+    s.send('record MANUAL')
+    assert probe(s)=='record MANUAL' and not listed(s)
+    s.send(b'\r')
+    assert (s.home/'executed').read_text()=='MANUAL\n'
+
+for mode in ('vi','emacs','omz'):
+    for cols in (80,100):
+        run(f'preview: gray text is not input; 10 to 20 rows then scroll; {mode}, {cols}',
+            mode,SCROLL_HISTORY,preview_expand,cols=cols)
+run('preview: expanding at the terminal bottom preserves a usable gray input line',
+    'omz',SCROLL_HISTORY+'repeat 40 print -- retained-output\n',preview_expand,cols=80)
+
+def preview_fuzzy(s):
+    s.send('SCROLL')  # Substring queries stay editable beside a separate gray preview.
+    assert probe(s)=='SCROLL'
+    s.send(b'\x1b[B'*10)
+    preview_state(s,11,1,20,typed='SCROLL')
+    assert s.screen.buffer[listed(s)[0][0]][10].fg=='green'
+    s.send('-')
+    assert probe(s)=='SCROLL-' and len(listed(s))==10
+    assert [int(line.split(' ',1)[0]) for _,line in listed(s)]==list(range(1,11))
+    s.send(b'\x15record SCROLL')
+    assert probe(s)=='record SCROLL'
+    assert s.screen.buffer[s.screen.cursor.y][4].fg=='green', 'syntax color was replaced by stale preview gray'
+    s.send(b'\r')
+    assert (s.home/'executed').read_text()=='SCROLL\n'
+run('preview: non-prefix query remains editable; typing extends it and collapses to ten',
+    'omz',SCROLL_HISTORY,preview_fuzzy)
+
+def preview_accept(s):
+    for key in (b'\t',b'\x1b[C',b'\x1bOC'):
+        clean(s,'')
+        s.send(b'\x1b[B'*12)
+        preview_state(s,12,1,20)
+        s.send(key)
+        assert probe(s)=='record SCROLL-24' and not listed(s)
+        assert not (s.home/'executed').exists()
+    clean(s,'')
+    s.send(b'\x1b[B'*12+b'\r')
+    assert (s.home/'executed').read_text()=='SCROLL-24\n'
+    assert probe(s)=='' and not listed(s)
+run('preview: Tab/right fill only, Enter accepts and executes selected command once',
+    'omz',SCROLL_HISTORY,preview_accept)
+
+def preview_cancel(s):
+    for key in (b'\x07',b'\x03',b'\x15',b'\x7f',b'\x1b'):
+        clean(s,'')
+        s.send(b'\x1b[B'*12)
+        preview_state(s,12,1,20)
+        s.send(key,.3)
+        assert probe(s)=='' and not listed(s)
+        mouse_closed(s)
+        if key==b'\x1b':
+            s.send('i')
+            assert probe(s)=='' and not listed(s)
+        s.send(b'\r')
+        assert not (s.home/'executed').exists(), key
+    clean(s,'')
+    s.send(b'\x1b[B\x06')  # A native forward-char must never consume our POSTDISPLAY.
+    assert probe(s)==''
+    s.send('record MANUAL\r')
+    assert (s.home/'executed').read_text()=='MANUAL\n'
+run('preview: dismiss, cancel, clear, delete and Esc never accept fake input',
+    'omz',SCROLL_HISTORY+"bindkey -M main '^F' forward-char\n",preview_cancel)
+
+def preview_mouse(s):
+    s.send(b'\x1b[B'*11)
+    preview_state(s,11,1,20)
+    entries=listed(s)
+    for index in (15,5):
+        y=listed(s)[index-1][0]+1
+        s.mouse(y=y);s.mouse(y=y,release=True)
+        mouse_filled(s,SCROLL_COMMANDS[-index],entries)
+        assert s.screen.display[s.screen.cursor.y].rstrip()=='hf> '+SCROLL_COMMANDS[-index]
+    s.send(b'\r')
+    assert (s.home/'executed').read_text()=='SCROLL-31\n'
+run('preview: clicking still fills real input and keeps expanded menu for another choice',
+    'omz',SCROLL_HISTORY,preview_mouse)
+
+def preview_pages(s):
+    s.send(b'\x1b[B'*12)
+    preview_state(s,12,1,20)
+    s.send(b'\x1b[5~')
+    assert probe(s)=='record SCROLL-35' and not listed(s)
+    s.send(b'\x1b[6~')
+    assert probe(s)=='' and not listed(s)
+    assert not (s.home/'executed').exists()
+run('preview: PageUp/PageDown keep native history independent of preview',
+    'omz',SCROLL_HISTORY,preview_pages)
+
+def preview_short_terminal(s):
+    s.send(b'\x1b[B'*21)
+    rows=listed(s)
+    assert 0<len(rows)<=s.rows-4
+    assert rows[-1][1].startswith('21 ')
+    ghost(s,SCROLL_COMMANDS[-21])
+    assert s.snapshot('short-terminal-preview')['selected_rows']==[rows[-1][0]]
+run('preview: short terminals fit the available height instead of overflowing twenty rows',
+    'omz',SCROLL_HISTORY,preview_short_terminal,rows=12)
+
+
+def preserve_typed(s):
+    query='record SCROLL'
+    s.send(query)
+    original=listed(s)
+    for key,index in ((b'\x1b[B',2),(b'\x1b[B',3),(b'\x1b[A',2),(b'\x1bOA',1),(b'\x1bOB',2)):
+        s.send(key)
+        ghost(s,SCROLL_COMMANDS[-index],query)
+        assert listed(s)==original
+    s.snapshot('typed-prefix-with-gray-suffix')
+    s.send('-EDITED')
+    assert probe(s)==query+'-EDITED' and not listed(s)
+    s.send(b'\r')
+    assert (s.home/'executed').read_text()=='SCROLL-EDITED\n'
+    # Burst typing still preserves the prefix when intermediate redraws are skipped.
+    clean(s,query+'\x1b[B-X')
+    assert probe(s)==query+'-X'
+    # Backspace edits the real prefix; deleting/retyping cannot silently accept preview.
+    clean(s,query)
+    s.send(b'\x1b[B\x7f')
+    assert probe(s)=='record SCROL'
+    s.send('L\r')
+    assert (s.home/'executed').read_text()=='SCROLL-EDITED\nSCROLL\n'
+    for keymap in ('main','viins','vicmd'):
+        assert (s.home/(keymap+'.before')).read_bytes()==(s.home/(keymap+'.after')).read_bytes()
+    return {'typed':query,'continued_input':query+'-EDITED','executed':['SCROLL-EDITED','SCROLL']}
+for mode in ('vi','emacs','omz'):
+    run(f'preview: preserve typed prefix and cursor when typing, deleting or bursting, {mode}',
+        mode,SCROLL_HISTORY,preserve_typed)
+
+def preserve_cd(s):
+    s.send('cd disk')
+    s.send(b'\x1b[B'*8)
+    ghost(s,'cd disk/rk3588','cd disk')
+    s.snapshot('cd-disk-original-prefix')
+    s.send('/rk')
+    assert probe(s)=='cd disk/rk'
+    assert int((s.home/'state').read_text().split()[0])==len('cd disk/rk')
+    assert not (s.home/'directories').exists()
+    s.send(b'\x1b[A\t')
+    assert probe(s)=='cd disk/rk3588' and not listed(s)
+    assert not (s.home/'directories').exists()
+    s.send(b'\r')
+    assert (s.home/'accepted-commands').read_text()=='cd disk/rk3588\n'
+    assert (s.home/'accept-widget').read_text()=='cd disk/rk3588\n'
+for cols in (80,100):
+    run(f'preview: preserve cd disk while browsing item 09 then typing /rk, {cols} columns',
+        'omz',CD_HISTORY,preserve_cd,cols=cols)
+
+def preserve_edit_cursor(s):
+    query='record SCROLL'
+    s.send(query)
+    s.send(b'\x1b[D'*3)
+    s.send(b'\x1b[B')
+    ghost(s,SCROLL_COMMANDS[-2],query,cursor=len(query)-3)
+    s.send('X')
+    assert probe(s)=='record SCRXOLL'
+    # Bracketed paste is applied to the preserved buffer, never to the candidate.
+    clean(s,query)
+    s.send(b'\x1b[B\x1b[200~-PASTED\x1b[201~')
+    assert probe(s)==query+'-PASTED'
+    s.send(b'\r')
+    assert (s.home/'executed').read_text()=='SCROLL-PASTED\n'
+run('preview: preserve insertion point and bracketed paste after selection',
+    'omz',SCROLL_HISTORY,preserve_edit_cursor)
+
+def preserve_dismiss(s):
+    query='record SCROLL'
+    for key in (b'\x07',b'\x1b'):
+        clean(s,query)
+        s.send(b'\x1b[B')
+        s.send(key,.3)
+        assert probe(s)==query and not listed(s)
+        if key==b'\x1b': s.send('a')
+        s.send('-MANUAL\r')
+    assert (s.home/'executed').read_text()=='SCROLL-MANUAL\nSCROLL-MANUAL\n'
+    # An explicit clear really clears user input as well as the preview.
+    clean(s,query)
+    s.send(b'\x1b[B\x15')
+    assert probe(s)=='' and not listed(s)
+    s.send('record FRESH\r')
+    assert (s.home/'executed').read_text().endswith('FRESH\n')
+run('preview: preserve user input on Ctrl-G and Esc, explicit clear starts fresh',
+    'omz',SCROLL_HISTORY,preserve_dismiss)
+
+def preserve_gray_acceptance(s):
+    query='record PRIORITY'
+    grey=query+'-most-recent-long'
+    for seq in (b'\x1b[B\x07',b'\x1b[B\x1b[D\x1b[C',b'\x1b[BX\x7f'):
+        clean(s,query)
+        s.send(seq)
+        assert probe(s)==query
+        s.send(b'\t')
+        assert probe(s)==grey, 'native suggestion must not be replaced by the hovered item'
+    assert not (s.home/'executed').exists()
+run('preview: preserve native gray suggestion acceptance after dismissal or editing',
+    'omz',NATIVE_HISTORY+NATIVE_TAB,preserve_gray_acceptance)
+
+def preserve_mouse(s):
+    s.send('record SCROLL')
+    s.send(b'\x1b[B'*10)
+    preview_state(s,11,1,20,typed='record SCROLL')
+    rows=listed(s)
+    for idx in (15,5):
+        y=listed(s)[idx-1][0]+1
+        s.mouse(y=y);s.mouse(y=y,release=True)
+        mouse_filled(s,SCROLL_COMMANDS[-idx],rows)
+    # Clicking commits actual input; subsequent arrow preview must also retain it.
+    s.send(b'\x1b[B')
+    ghost(s,SCROLL_COMMANDS[-6],SCROLL_COMMANDS[-5])
+    s.send('-EDITED\r')
+    assert (s.home/'executed').read_text()=='SCROLL-31-EDITED\n'
+run('preview: preserve clicked input during later arrow navigation; mouse can reselect',
+    'omz',SCROLL_HISTORY,preserve_mouse)
+
+def preserve_unicode(s):
+    s.send('中文')
+    s.send(b'\x1b[B')
+    assert probe(s)=='中文'
+    assert int((s.home/'state').read_text().split()[0])==2
+    assert s.screen.cursor.x==8
+    assert s.screen.display[s.screen.cursor.y].startswith('hf> 中文  → record 中文')
+    s.snapshot('unicode-query-with-separate-gray-preview')
+    s.send('路径')
+    assert probe(s)=='中文路径'
+    # Selection is still the full command, not the displayed annotation.
+    s.send(b'\x1b[A\r')
+    assert (s.home/'executed').read_text()=='中文路径一\n'
+run('preview: preserve Unicode non-prefix query without mixing preview into input',
+    'omz',"fc -p $HOME/unicode-history 100\nprint -s -- 'record 中文路径二'\nprint -s -- 'record 中文路径一'\n",preserve_unicode)
 
 report = {
     'plugin': PLUGIN,
