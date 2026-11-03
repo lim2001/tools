@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""PTY acceptance for history_fuzzy (requires Python 3, pyte, zsh and oh-my-zsh).
+"""PTY acceptance for easyCmd (requires Python 3, pyte, zsh and oh-my-zsh).
 
-Run: python3 assist/tests/history_fuzzy_pty.py
-Optional: --omz /path/to/oh-my-zsh --plugin /path/to/history_fuzzy.zsh
+Run: python3 assist/tests/easyCmd_pty.py
+Optional: --omz /path/to/oh-my-zsh --plugin /path/to/easyCmd.zsh
 Use --mouse-only for mouse cases, --focused for native keys/Enter,
 and --history-only for empty-input menus and PageUp/PageDown.
 Use --preview-only for gray previews and 10-to-20-row expansion,
@@ -52,7 +52,7 @@ def contrast(fg, bg):
     return (high + .05) / (low + .05)
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--plugin', type=Path, default=Path(__file__).resolve().parents[1] / 'history_fuzzy.zsh')
+parser.add_argument('--plugin', type=Path, default=Path(__file__).resolve().parents[1] / 'easyCmd.zsh')
 parser.add_argument('--omz', type=Path, default=Path.home() / '.oh-my-zsh')
 parser.add_argument('--preserve-only', action='store_true', help='only original input preservation regressions')
 parser.add_argument('--preview-only', action='store_true', help='only gray preview and 10-to-20 row expansion cases')
@@ -66,7 +66,7 @@ PLUGIN = str(args.plugin.resolve())
 OMZ = str(args.omz.resolve())
 if not Path(OMZ, 'oh-my-zsh.sh').is_file():
     parser.error('--omz must point to oh-my-zsh with vi-mode, autosuggestions and syntax-highlighting')
-ARTIFACTS = Path(tempfile.mkdtemp(prefix='history-fuzzy-pty-'))
+ARTIFACTS = Path(tempfile.mkdtemp(prefix='easyCmd-pty-'))
 print('Evidence: ' + str(ARTIFACTS), flush=True)
 
 class TerminalScreen(pyte.Screen):
@@ -79,7 +79,7 @@ class TerminalScreen(pyte.Screen):
 
 class Xterm:
     def __init__(self, cols, rows):
-        self.proc = subprocess.Popen(['node', str(Path(__file__).with_name('history_fuzzy_xterm.cjs')),
+        self.proc = subprocess.Popen(['node', str(Path(__file__).with_name('easyCmd_xterm.cjs')),
                                       str(args.xterm_headless.resolve())],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.state = self.call(op='init', cols=cols, rows=rows)
@@ -128,11 +128,11 @@ class Session:
 # Wait for ZLE, not a fixed startup delay: Ctrl-C must never interrupt .zshrc.
 for map in main viins vicmd; do bindkey -L -M $map > $HOME/$map.before; done
 autoload -Uz add-zle-hook-widget
-_hf_test_ready() { : > $HOME/ready; }
-add-zle-hook-widget line-init _hf_test_ready
+_ec_test_ready() { : > $HOME/ready; }
+add-zle-hook-widget line-init _ec_test_ready
 """)
         if plugin:
-            shutil.copyfile(plugin, self.home / 'history_fuzzy.zsh')
+            shutil.copyfile(plugin, self.home / 'easyCmd.zsh')
         self.cols, self.rows = cols, rows
         self.screen = TerminalScreen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
@@ -255,21 +255,21 @@ touch $HOME/completion/alpha $HOME/completion/alpine
 cd $HOME/completion
 probe() {
   print -r -- "$POSTDISPLAY" > $HOME/postdisplay
-  print -r -- "$CURSOR" "$KEYMAP" "$_hist_fuzzy_hover" "${#_hist_fuzzy_shown}" "$COLUMNS" "$LINES" > $HOME/state
+  print -r -- "$CURSOR" "$KEYMAP" "$_easyCmd_hover" "${#_easyCmd_shown}" "$COLUMNS" "$LINES" > $HOME/state
   print -rl -- "${region_highlight[@]}" > $HOME/highlights
   bindkey -L -M main > $HOME/main.after
   bindkey -L -M viins > $HOME/viins.after
   bindkey -L -M vicmd > $HOME/vicmd.after
   print -r -- "$BUFFER" > $HOME/buffer
 }
-zle -N _hf_probe probe
-bindkey -M main '^X?' _hf_probe
-bindkey -M viins '^X?' _hf_probe
-bindkey -M vicmd '^X?' _hf_probe
+zle -N _ec_probe probe
+bindkey -M main '^X?' _ec_probe
+bindkey -M viins '^X?' _ec_probe
+bindkey -M vicmd '^X?' _ec_probe
 bindkey -L -M main > $HOME/main.before
 bindkey -L -M viins > $HOME/viins.before
 bindkey -L -M vicmd > $HOME/vicmd.before
-source $HOME/history_fuzzy.zsh
+source $HOME/easyCmd.zsh
 '''
 
 
@@ -504,7 +504,7 @@ def fifteen(s):
     assert len(listed(s))==15 and listed(s)[-1][1].startswith('15 ')
     assert probe(s)=='record MANUAL'
     assert s.snapshot('bottom-stop')['selected_rows']==[listed(s)[-1][0]]
-run('15 results start with ten, expand to configured limit, and stop at ends','omz','HIST_FUZZY_MAX_SHOW=15\n',fifteen)
+run('15 results start with ten, expand to configured limit, and stop at ends','omz','EASYCMD_MAX_SHOW=15\n',fifteen)
 
 def resize(s):
     s.send('record MANUAL');assert len(listed(s))==10
@@ -729,14 +729,14 @@ run('native keys: explicit selection, cursor movement, edit, dismissal and Alt-1
 CD_HISTORY = r'''
 mkdir -p $HOME/completion/disk/{a,b,c,d,e,f,g,h,rk3588,zzzzzzzzzz}
 for name in a b c d e f g h rk3588 zzzzzzzzzz; do print -s -- "cd disk/$name"; done
-_hf_cd_changed() { print -r -- "$PWD" >> $HOME/directories; }
-_hf_command_accepted() { print -r -- "$1" >> $HOME/accepted-commands; }
-add-zsh-hook chpwd _hf_cd_changed
-add-zsh-hook preexec _hf_command_accepted
-_hf_original_enter() { print -r -- "$BUFFER" >> $HOME/accept-widget; zle .accept-line; }
-zle -N _hf_original_enter
-bindkey -M main '^M' _hf_original_enter
-bindkey -M main '^J' _hf_original_enter
+_ec_cd_changed() { print -r -- "$PWD" >> $HOME/directories; }
+_ec_command_accepted() { print -r -- "$1" >> $HOME/accepted-commands; }
+add-zsh-hook chpwd _ec_cd_changed
+add-zsh-hook preexec _ec_command_accepted
+_ec_original_enter() { print -r -- "$BUFFER" >> $HOME/accept-widget; zle .accept-line; }
+zle -N _ec_original_enter
+bindkey -M main '^M' _ec_original_enter
+bindkey -M main '^J' _ec_original_enter
 bindkey -L -M main > $HOME/main.before
 '''
 
@@ -1065,9 +1065,9 @@ def mouse_function_key(s):
     assert probe(s)=='record MANUAL'
     assert not s.replies
 run('mouse: private cursor replies do not override Shift-F3', 'omz', r'''
-_hf_function_key() { print -r -- called > $HOME/function-key; }
-zle -N _hf_function_key
-bindkey -M main '\e[1;2R' _hf_function_key
+_ec_function_key() { print -r -- called > $HOME/function-key; }
+zle -N _ec_function_key
+bindkey -M main '\e[1;2R' _ec_function_key
 ''',mouse_function_key)
 
 
@@ -1306,14 +1306,14 @@ def recent_disabled(s):
     s.send(b'\x1b[5~')
     assert probe(s) == RECENT_COMMANDS[-1] and not listed(s)
 run('history keys: max_show zero disables menu but keeps PageUp history available',
-    'omz', RECENT_HISTORY + 'HIST_FUZZY_MAX_SHOW=0\n', recent_disabled)
+    'omz', RECENT_HISTORY + 'EASYCMD_MAX_SHOW=0\n', recent_disabled)
 
 def recent_filtered(s):
     s.send(b'\x1b[A')
     recent_selected(s, 1)
     assert len(listed(s)) == 10
 run('history keys: recent order deduplicates, filters ignored commands and caps window at ten',
-    'omz', RECENT_HISTORY + "HIST_FUZZY_MAX_SHOW=15\nprint -s -- 'record RECENT-most-recent-long-15'\nprint -s -- 'shl'\n", recent_filtered)
+    'omz', RECENT_HISTORY + "EASYCMD_MAX_SHOW=15\nprint -s -- 'record RECENT-most-recent-long-15'\nprint -s -- 'shl'\n", recent_filtered)
 
 SCROLL_COMMANDS = [f'record SCROLL-{n:02d}' for n in range(1, 36)]
 SCROLL_HISTORY = 'fc -p $HOME/scroll-history 200\n' + ''.join(
@@ -1421,7 +1421,7 @@ def scroll_long(s):
     s.send(b'\x03')
     assert probe(s) == '' and not listed(s)
 run('scroll: gray preview keeps full Unicode command and honors smaller window size',
-    'omz', SCROLL_HISTORY + "HIST_FUZZY_MAX_SHOW=5\nprint -s -- 'record "+'中文路径'*20+"'\n", scroll_long, cols=80)
+    'omz', SCROLL_HISTORY + "EASYCMD_MAX_SHOW=5\nprint -s -- 'record "+'中文路径'*20+"'\n", scroll_long, cols=80)
 
 def ghost(s, command, typed='', cursor=None):
     cursor = len(typed) if cursor is None else cursor

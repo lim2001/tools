@@ -1,5 +1,5 @@
 // Optional PTY terminal backend. Install @xterm/headless outside the repository,
-// then pass its module directory to history_fuzzy_pty.py --xterm-headless.
+// then pass its module directory to easyCmd_pty.py --xterm-headless.
 const readline = require('node:readline');
 const { Terminal } = require(process.argv[2]);
 let terminal;
