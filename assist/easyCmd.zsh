@@ -6,7 +6,7 @@
 # Tab/→ 默认保留输入行原有补全；先按 ↑/↓ 选择历史项后，Tab/→ 才填该项。
 # Alt-1..9 填当前窗口第 N 行；Ctrl-G 收起；主动选择后回车执行该项，
 # 未主动选择或已返回输入行编辑时，回车只执行 BUFFER。
-# 左键单击只填入历史项，保留原候选和顺序供再次点选；按回车才执行。
+# 左键单击填入并保留原菜单；回车执行，或在同一项上双击直接执行一次。
 # Esc、viins、emacs、main、vicmd 的原生绑定均不改写。
 #
 # 下拉渲染用 ZLE 的 POSTDISPLAY 和 region_highlight；仅点击时查询首项位置，
@@ -21,8 +21,8 @@
 # 前缀、子串和模糊匹配不分排序优先级，命令长短平权，不统计频次。
 
 [[ -o interactive && -o zle ]] || return 0
-(( ${_EASYCMD_VERSION:-0} >= 26 )) && return 0
-typeset -g _EASYCMD_VERSION=26
+(( ${_EASYCMD_VERSION:-0} >= 27 )) && return 0
+typeset -g _EASYCMD_VERSION=27
 zmodload zsh/parameter
 zmodload zsh/zleparameter
 zmodload zsh/zselect
@@ -93,6 +93,8 @@ fi
 : ${EASYCMD_COLOR_HOVER:=bg=23,fg=255}
 : ${EASYCMD_COLOR_HOVER_MATCH:=fg=157,bold}
 : ${EASYCMD_COLOR_PREVIEW:=${ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE:-fg=8}}
+# 同项、同位置附近的两次左键点击间隔；0 禁用双击执行。
+: ${EASYCMD_DOUBLE_CLICK_MS:=400}
 : ${EASYCMD_FUZZY_MAX:=4}
 : ${EASYCMD_FUZZY_MIN_LEN:=2}
 : ${EASYCMD_SPAN_SLACK:=3}
@@ -350,6 +352,9 @@ typeset -g _easyCmd_saved_suggestion=''
 typeset -g _easyCmd_mouse_enabled=0 _easyCmd_mouse_pressed=0
 typeset -g _easyCmd_mouse_buffer='' _easyCmd_mouse_command=''
 typeset -g _easyCmd_mouse_first=0 _easyCmd_mouse_size=''
+typeset -gF _easyCmd_mouse_press_time=0 _easyCmd_click_time=0
+typeset -gi _easyCmd_mouse_double=0 _easyCmd_click_index=0 _easyCmd_click_x=0 _easyCmd_click_y=0
+typeset -g _easyCmd_click_command='' _easyCmd_click_size=''
 typeset -g _easyCmd_pinned=0 _easyCmd_pinned_buffer=''
 typeset -g _easyCmd_recent=0
 typeset -g _easyCmd_suppressed='' _easyCmd_closed=0 _easyCmd_hover=1
@@ -402,6 +407,10 @@ _easyCmd_preview_text() {
 
 _easyCmd_update() {
   emulate -L zsh
+  # 调整窗口大小后，前一次点击不能再组成双击。
+  if (( _easyCmd_click_time )) && [[ $_easyCmd_click_size != "$LINES $COLUMNS" ]]; then
+    _easyCmd_mouse_reset
+  fi
   # 翻页键调取历史时，建议插件的中间重绘也保持列表收起。
   (( ${_easyCmd_history_browsing:-0} )) && { _easyCmd_shown=(); return 0; }
   # 预览及鼠标填入都保留原查询；真实文字变化后重新搜索。
@@ -462,7 +471,7 @@ _easyCmd_draw() {
 _easyCmd_compose() {
   emulate -L zsh
   _easyCmd_detach
-  (( PENDING || KEYS_QUEUED_COUNT )) && return 0
+  (( PENDING || KEYS_QUEUED_COUNT )) && [[ $1 != mouse ]] && return 0
   _easyCmd_update
   (( ${#_easyCmd_shown} )) || { _easyCmd_mouse_off; return 0; }
   local line row colour number REPLY
@@ -542,7 +551,7 @@ _easyCmd_dispatch() {
 }
 
 _easyCmd_call() {
-  _easyCmd_mouse_pressed=0
+  _easyCmd_mouse_reset
   local original=$1 ret=0 ec_before_buffer=$BUFFER ec_before_cursor=$CURSOR
   shift
   local -i completion=0
@@ -591,7 +600,7 @@ _easyCmd_call() {
 }
 
 _easyCmd_key() {
-  _easyCmd_mouse_pressed=0
+  _easyCmd_mouse_reset
   emulate -L zsh
   local action=${WIDGET#easyCmd-}
   local -i idx opening=0
@@ -679,8 +688,15 @@ _easyCmd_mouse_on() {
   _easyCmd_mouse_enabled=1
 }
 
-_easyCmd_mouse_off() {
+# 任何键盘操作、失效的鼠标事件或菜单退出都会打断连续点击。
+_easyCmd_mouse_reset() {
   _easyCmd_mouse_pressed=0
+  _easyCmd_mouse_double=0
+  _easyCmd_click_time=0
+}
+
+_easyCmd_mouse_off() {
+  _easyCmd_mouse_reset
   (( _easyCmd_mouse_enabled )) || return 0
   print -rn -- $'\e[?1000l\e[?1006l' > /dev/tty
   _easyCmd_mouse_enabled=0
@@ -775,11 +791,14 @@ _easyCmd_mouse() {
   emulate -L zsh
   local ec_fd ec_char ec_packet ec_command
   local -i ec_button ec_x ec_y ec_idx ec_first=0 ec_pressed=$_easyCmd_mouse_pressed
-  local -i ec_width=$COLUMNS ec_height=$LINES
+  local -i ec_width=$COLUMNS ec_height=$LINES ec_valid_click=0 ec_execute=0
+  local -i ec_double=$_easyCmd_mouse_double
+  local -F ec_now=$EPOCHREALTIME
   local -a match mbegin mend
   local MATCH
   exec {ec_fd}<>/dev/tty || return 0
   _easyCmd_mouse_pressed=0
+  _easyCmd_mouse_double=0
   {
     _easyCmd_mouse_packet Mm || return 0
     [[ $ec_packet =~ '^([0-9]{1,3});([0-9]{1,5});([0-9]{1,5})([Mm])$' ]] || return 0
@@ -789,8 +808,10 @@ _easyCmd_mouse() {
     _easyCmd_mouse_pressed=0
     (( ec_button == 0 && ec_x >= 1 && ec_x < COLUMNS && ec_y >= 1 && ec_y <= LINES )) || return 0
     (( _easyCmd_mouse_enabled && _easyCmd_active && ! _easyCmd_closed && ${#_easyCmd_shown} )) || return 0
-    [[ ( $BUFFER == "$_easyCmd_query" || ( $_easyCmd_pinned == 1 && $BUFFER == "$_easyCmd_pinned_buffer" ) ) &&
-       -n $_easyCmd_suffix && $POSTDISPLAY == *"$_easyCmd_suffix" ]] || return 0
+    [[ $BUFFER == "$_easyCmd_query" || ( $_easyCmd_pinned == 1 && $BUFFER == "$_easyCmd_pinned_buffer" ) ]] || return 0
+    # 同批到达的快速点击可能跳过重绘；先恢复相同候选的布局，再查询真实位置。
+    [[ -n $_easyCmd_suffix ]] || _easyCmd_compose mouse
+    [[ -n $_easyCmd_suffix && $POSTDISPLAY == *"$_easyCmd_suffix" ]] || return 0
     (( BUFFERLINES <= LINES )) || return 0
     [[ $(command stty size <&$ec_fd 2>/dev/null) == "$ec_height $ec_width" ]] || return 0
     [[ $ec_kind == M ]] || (( ec_pressed )) || return 0
@@ -801,6 +822,20 @@ _easyCmd_mouse() {
     (( ec_idx >= 1 && ec_idx <= ${#_easyCmd_shown} )) || return 0
     ec_command=$_easyCmd_shown[ec_idx]
     if [[ $ec_kind == M ]]; then
+      # 只把上一轮完整点击与当前按下配对；拖动、跨项、跨屏幕位置不执行。
+      if (( EASYCMD_DOUBLE_CLICK_MS > 0 && _easyCmd_click_time > 0 &&
+            ec_now >= _easyCmd_click_time &&
+            (ec_now - _easyCmd_click_time) * 1000 <= EASYCMD_DOUBLE_CLICK_MS &&
+            _easyCmd_click_index == _easyCmd_top + ec_idx - 1 &&
+            ec_y == _easyCmd_click_y && ec_x - _easyCmd_click_x <= 2 && _easyCmd_click_x - ec_x <= 2 )) &&
+          [[ $ec_command == "$_easyCmd_click_command" && $BUFFER == "$ec_command" &&
+             $_easyCmd_pinned == 1 && $_easyCmd_click_size == "$ec_height $ec_width" ]]; then
+        _easyCmd_mouse_double=1
+      fi
+      _easyCmd_click_time=0
+      _easyCmd_mouse_press_time=$ec_now
+      _easyCmd_click_x=$ec_x
+      _easyCmd_click_y=$ec_y
       _easyCmd_mouse_pressed=$ec_idx
       _easyCmd_mouse_buffer=$BUFFER
       _easyCmd_mouse_command=$ec_command
@@ -808,6 +843,7 @@ _easyCmd_mouse() {
       _easyCmd_mouse_size="$ec_height $ec_width"
       _easyCmd_hover=$(( _easyCmd_top + ec_idx - 1 ))
       _easyCmd_engaged=0
+      ec_valid_click=1
     elif (( ec_idx == ec_pressed && ec_first == _easyCmd_mouse_first )) &&
          [[ $BUFFER == "$_easyCmd_mouse_buffer" && $ec_command == "$_easyCmd_mouse_command" &&
             $_easyCmd_mouse_size == "$ec_height $ec_width" ]]; then
@@ -819,10 +855,30 @@ _easyCmd_mouse() {
       _easyCmd_pinned=1
       _easyCmd_pinned_buffer=$BUFFER
       _easyCmd_engaged=0
+      ec_valid_click=1
+      # 仍需有效的第二次松开；长按或横向拖动只填入，不能直接执行。
+      if (( ec_now >= _easyCmd_mouse_press_time &&
+            (ec_now - _easyCmd_mouse_press_time) * 1000 <= EASYCMD_DOUBLE_CLICK_MS &&
+            ec_x - _easyCmd_click_x <= 2 && _easyCmd_click_x - ec_x <= 2 )); then
+        if (( ec_double )); then
+          ec_execute=1
+        else
+          _easyCmd_click_time=$_easyCmd_mouse_press_time
+          _easyCmd_click_command=$ec_command
+          _easyCmd_click_index=$(( _easyCmd_top + ec_idx - 1 ))
+          _easyCmd_click_size="$ec_height $ec_width"
+        fi
+      fi
     fi
   } always {
+    (( ec_valid_click )) || _easyCmd_mouse_reset
     exec {ec_fd}>&-
   }
+  if (( ec_execute )); then
+    _easyCmd_dismiss
+    # 与实际回车走相同原生部件，先关菜单，再接受输入；迟到点击不会再次执行。
+    _easyCmd_native_key $'\r'
+  fi
   return 0
 }
 

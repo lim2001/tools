@@ -3,7 +3,8 @@
 
 Run: python3 assist/tests/easyCmd_pty.py
 Optional: --omz /path/to/oh-my-zsh --plugin /path/to/easyCmd.zsh
-Use --mouse-only for mouse cases, --focused for native keys/Enter,
+Use --double-click-only for double-click cases, --mouse-only for all mouse cases,
+--focused for native keys/Enter,
 and --history-only for empty-input menus and PageUp/PageDown.
 Use --preview-only for gray previews and 10-to-20-row expansion,
 or --preserve-only for editing existing input after arrow navigation.
@@ -55,6 +56,7 @@ def contrast(fg, bg):
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--plugin', type=Path, default=Path(__file__).resolve().parents[1] / 'easyCmd.zsh')
 parser.add_argument('--omz', type=Path, default=Path.home() / '.oh-my-zsh')
+parser.add_argument('--double-click-only', action='store_true', help='only double-click execution regressions')
 parser.add_argument('--ranking-only', action='store_true', help='only recency ranking regressions')
 parser.add_argument('--preserve-only', action='store_true', help='only original input preservation regressions')
 parser.add_argument('--preview-only', action='store_true', help='only gray preview and 10-to-20 row expansion cases')
@@ -462,7 +464,7 @@ def exercise(mode, cols):
 
 
 matrix=[]
-for mode in (() if args.focused or args.mouse_only or args.history_only or args.scroll_only or args.preview_only or args.preserve_only or args.ranking_only else ('vi','emacs','omz')):
+for mode in (() if args.focused or args.mouse_only or args.history_only or args.scroll_only or args.preview_only or args.preserve_only or args.ranking_only or args.double_click_only else ('vi','emacs','omz')):
     for cols in (80,100):
         result=exercise(mode,cols)
         matrix.append(result)
@@ -470,6 +472,8 @@ for mode in (() if args.focused or args.mouse_only or args.history_only or args.
 
 edge_results=[]
 def run(name, mode, extra, test, cols=100, rows=24, cpr=True):
+    if args.double_click_only and not name.startswith('mouse: double'):
+        return
     if args.ranking_only and not name.startswith('ranking:'):
         return
     if args.preserve_only and not name.startswith('preview: preserve'):
@@ -839,7 +843,8 @@ def mouse_cd(s):
     s.mouse(y=y,release=True,delay=.3)
     mouse_filled(s, 'cd disk/rk3588', rows)
     s.snapshot('direct-click-filled-not-executed')
-    # A queued extra click cannot execute the newly filled input.
+    # A separate later click still only fills; a deliberate fast double click executes.
+    s.read(.45)
     s.send(mouse_report(y=y)+mouse_report(y=y,release=True))
     mouse_filled(s, 'cd disk/rk3588', rows)
     # A mistaken first choice can be corrected using the original numbered menu.
@@ -1140,6 +1145,152 @@ def mouse_preserved_keyboard(s):
     assert (s.home/'executed').read_text()==entries[7][1][3:].removeprefix('record ')+'\n'
     mouse_closed(s)
 run('mouse: preserved menu still supports arrow selection and Enter','omz','',mouse_preserved_keyboard)
+
+# Double clicks are tested without sending a probe between clicks: a probe is a
+# keyboard widget, so it must break the same click sequence as any real key.
+def click_fast(s, y, x=4):
+    s.mouse(x=x,y=y,delay=.03)
+    s.mouse(x=x,y=y,release=True,delay=.03)
+
+def double_cd(s):
+    entries=mouse_rows(s,'cd disk')
+    y=entries[8][0]+1
+    click_fast(s,y)
+    assert not (s.home/'accepted-commands').exists()
+    assert [text for _,text in listed(s)]==[text for _,text in entries]
+    s.snapshot('double-first-click-filled-menu-kept')
+    s.mouse(x=5,y=y,delay=.03)
+    assert not (s.home/'accepted-commands').exists(), 'second press executed before release'
+    s.mouse(x=5,y=y,release=True,delay=.25)
+    assert (s.home/'directories').read_text()==str(s.home/'completion/disk/rk3588')+'\n'
+    assert (s.home/'accepted-commands').read_text()=='cd disk/rk3588\n'
+    assert (s.home/'accept-widget').read_text()=='cd disk/rk3588\n'
+    mouse_closed(s)
+    assert probe(s)=='' and not listed(s)
+    for keymap in ('main','viins','vicmd'):
+        assert (s.home/f'{keymap}.before').read_bytes()==(s.home/f'{keymap}.after').read_bytes()
+    # Late reports at the former row must not repeat the accepted command.
+    s.send(mouse_report(y=y)+mouse_report(y=y,release=True))
+    assert probe(s)=='' and (s.home/'accepted-commands').read_text()=='cd disk/rk3588\n'
+    s.snapshot('double-executed-once')
+    return {'command':'cd disk/rk3588','original_enter_calls':1,'first_click_kept_menu':True}
+for mode,cols in (('vi',80),('emacs',100),('omz',80),('omz',100)):
+    run(f'mouse: double click item 09 executes through original Enter exactly once, {mode}, {cols}',
+        mode,CD_HISTORY,double_cd,cols=cols)
+
+DOUBLE_HISTORY="fc -p $HOME/double-history 100\nprint -s -- 'record CLICK'\n"
+def double_slow(s):
+    y=mouse_rows(s,'record')[0][0]+1
+    click_fast(s,y)
+    s.read(.45)
+    click_fast(s,y)
+    mouse_filled(s,'record CLICK')
+    s.send(b'\r')
+    assert (s.home/'executed').read_text()=='CLICK\n'
+run('mouse: double timeout leaves two single clicks and Enter executes once','omz',DOUBLE_HISTORY,double_slow)
+
+def double_reselect(s):
+    entries=mouse_rows(s)
+    first=entries[8][0]+1
+    second=entries[1][0]+1
+    click_fast(s,first)
+    click_fast(s,second)
+    assert not (s.home/'executed').exists(), 'different row counted as a double click'
+    assert listed(s)==entries
+    click_fast(s,second)
+    assert (s.home/'executed').read_text()==entries[1][1][3:].removeprefix('record ')+'\n'
+    assert probe(s)=='' and not listed(s)
+run('mouse: double requires same command; changing rows fills before a new double can execute','omz','',double_reselect)
+
+def double_burst(s):
+    y=mouse_rows(s,'record')[0][0]+1
+    packet=mouse_report(y=y)+mouse_report(y=y,release=True)
+    s.send(packet*3,.5)
+    assert (s.home/'executed').read_text()=='CLICK\n'
+    assert probe(s)=='' and not listed(s)
+    mouse_closed(s)
+run('mouse: double and third queued click execute once, with no mouse text leaking','omz',DOUBLE_HISTORY,double_burst)
+
+def double_keys(s):
+    for key in (b'X\x7f',b'\x1b[D\x1b[C',b'\x1b[B\x1b[A',b'\x07\x1b[B',b'\x03record'):
+        y=mouse_rows(s,'record')[0][0]+1
+        click_fast(s,y)
+        s.send(key,.06)
+        assert listed(s), (key,s.screen.display)
+        click_fast(s,listed(s)[0][0]+1)
+        assert not (s.home/'executed').exists(),key
+        assert probe(s)=='record CLICK'
+run('mouse: double is cancelled by editing, cursor movement, arrows, dismissal and Ctrl-C',
+    'omz',DOUBLE_HISTORY+'EASYCMD_DOUBLE_CLICK_MS=2000\n',double_keys)
+
+def double_resize(s):
+    y=mouse_rows(s,'record')[0][0]+1
+    click_fast(s,y)
+    s.resize(80,24)
+    click_fast(s,listed(s)[0][0]+1)
+    mouse_filled(s,'record CLICK')
+run('mouse: double is cancelled by terminal resize even within the configured interval',
+    'omz',DOUBLE_HISTORY+'EASYCMD_DOUBLE_CLICK_MS=2000\n',double_resize)
+
+def double_invalid(s):
+    for kind in ('right','outside','release','drag','far','hold'):
+        y=mouse_rows(s,'record')[0][0]+1
+        click_fast(s,y)
+        if kind=='right': s.send(mouse_report(button=2,y=y)+mouse_report(button=2,y=y,release=True),.03)
+        elif kind=='outside': s.send(mouse_report(y=24)+mouse_report(y=24,release=True),.03)
+        elif kind=='release': s.send(mouse_report(y=y,release=True),.03)
+        elif kind=='drag':
+            s.mouse(y=y,delay=.03);s.mouse(y=y,x=15,release=True,delay=.03)
+        elif kind=='far': click_fast(s,y,x=15)
+        else:
+            s.mouse(y=y,delay=.45)
+            s.mouse(y=y,release=True,delay=.03)
+        assert not (s.home/'executed').exists(),kind
+        if kind in ('right','outside','release','drag','hold'):
+            click_fast(s,y)
+            assert not (s.home/'executed').exists(),kind
+        assert probe(s)=='record CLICK'
+run('mouse: double rejects invalid events, stray releases, wide pointer movement and long presses',
+    'omz',DOUBLE_HISTORY,double_invalid)
+
+def double_disabled(s):
+    y=mouse_rows(s,'record')[0][0]+1
+    click_fast(s,y);click_fast(s,y)
+    mouse_filled(s,'record CLICK')
+    s.send(b'\r')
+    assert (s.home/'executed').read_text()=='CLICK\n'
+run('mouse: double can be disabled while single click and Enter still work',
+    'omz',DOUBLE_HISTORY+'EASYCMD_DOUBLE_CLICK_MS=0\n',double_disabled)
+
+def double_recent(s):
+    s.send(b'\x1b[B')
+    entries=listed(s)
+    y=entries[0][0]+1
+    click_fast(s,y);click_fast(s,y)
+    assert (s.home/'executed').read_text()=='CLICK\n'
+    assert probe(s)=='' and not listed(s)
+run('mouse: double works in empty-input recent history menu','omz',DOUBLE_HISTORY,double_recent)
+
+def double_scrolled(s):
+    s.send('record DOUBLE')
+    s.send(b'\x1b[B'*24)
+    entries=listed(s)
+    assert len(entries)==20 and entries[0][1].startswith('06 '),entries
+    y=entries[4][0]+1
+    command=entries[4][1][3:]
+    click_fast(s,y);click_fast(s,y)
+    assert (s.home/'executed').read_text()==command.removeprefix('record ')+'\n'
+    assert probe(s)=='' and not listed(s)
+run('mouse: double executes the correct full command after expansion and scrolling',
+    'omz','fc -p $HOME/double-scroll 100\nfor n in {01..35}; do print -s -- "record DOUBLE-$n"; done\n',double_scrolled)
+
+def double_no_response(s):
+    y=mouse_rows(s,'record')[0][0]+1
+    packet=mouse_report(y=y)+mouse_report(y=y,release=True)
+    s.send(packet*2,1.1)
+    assert probe(s)=='record' and not (s.home/'executed').exists()
+run('mouse: double never guesses a command when terminal position replies are unavailable',
+    'omz',DOUBLE_HISTORY,double_no_response,cpr=False)
 
 RECENT_COMMANDS = [f'record RECENT-{n:02d}' for n in range(1, 15)] + ['record RECENT-most-recent-long-15']
 RECENT_HISTORY = 'fc -p $HOME/recent-history 100\n' + ''.join(
