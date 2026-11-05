@@ -9,6 +9,7 @@ and --history-only for empty-input menus and PageUp/PageDown.
 Use --preview-only for gray previews and 10-to-20-row expansion,
 or --preserve-only for editing existing input after arrow navigation.
 Use --ranking-only for time-first matching and recent-command promotion.
+Use --async-only for background refresh and input preservation regressions.
 Each child uses an empty environment, a fresh HOME and a private plugin copy.
 Only synthetic history is loaded. The PTY and terminal emulator share dimensions.
 CPR replies come from the emulator's cursor, with separate no-response cases.
@@ -58,6 +59,8 @@ parser.add_argument('--plugin', type=Path, default=Path(__file__).resolve().pare
 parser.add_argument('--omz', type=Path, default=Path.home() / '.oh-my-zsh')
 parser.add_argument('--double-click-only', action='store_true', help='only double-click execution regressions')
 parser.add_argument('--ranking-only', action='store_true', help='only recency ranking regressions')
+parser.add_argument('--async-only', action='store_true', help='only background history refresh regressions')
+parser.add_argument('--case', help='only edge cases whose name contains this text')
 parser.add_argument('--preserve-only', action='store_true', help='only original input preservation regressions')
 parser.add_argument('--preview-only', action='store_true', help='only gray preview and 10-to-20 row expansion cases')
 parser.add_argument('--scroll-only', action='store_true', help='only scrolling and live input selection cases')
@@ -464,7 +467,7 @@ def exercise(mode, cols):
 
 
 matrix=[]
-for mode in (() if args.focused or args.mouse_only or args.history_only or args.scroll_only or args.preview_only or args.preserve_only or args.ranking_only or args.double_click_only else ('vi','emacs','omz')):
+for mode in (() if args.focused or args.mouse_only or args.history_only or args.scroll_only or args.preview_only or args.preserve_only or args.ranking_only or args.double_click_only or args.async_only or args.case else ('vi','emacs','omz')):
     for cols in (80,100):
         result=exercise(mode,cols)
         matrix.append(result)
@@ -472,6 +475,10 @@ for mode in (() if args.focused or args.mouse_only or args.history_only or args.
 
 edge_results=[]
 def run(name, mode, extra, test, cols=100, rows=24, cpr=True):
+    if args.case and args.case not in name:
+        return
+    if args.async_only and not name.startswith('async:'):
+        return
     if args.double_click_only and not name.startswith('mouse: double'):
         return
     if args.ranking_only and not name.startswith('ranking:'):
@@ -1975,6 +1982,208 @@ def rank_literal(s):
     assert [line[3:] for _,line in listed(s)]==['record newer-a[','a[-older'],listed(s)
 run('ranking: literal pattern characters keep recent-first matching',
     'omz',"fc -p $HOME/literal-rank 100\nprint -s -- 'a[-older'\nprint -s -- 'record newer-a['\nprint -s -- 'record irrelevant-aX'\n",rank_literal)
+
+ASYNC_PROBE = r'''
+functions[_ec_original_probe]=$functions[probe]
+probe() {
+  _ec_original_probe
+  print -rl -- "${#_easyCmd_cache}" "$_easyCmd_cache_revision" "$_easyCmd_refresh_fd" "$_easyCmd_refresh_generation" > $HOME/async-state
+  print -rl -- "${_easyCmd_cache[@]}" > $HOME/cache-contents
+}
+functions[_ec_original_redraw]=$functions[_easyCmd_refresh_redraw]
+_easyCmd_refresh_redraw() {
+  print -r -- "$_easyCmd_cache_revision" > $HOME/cache-ready
+  _ec_original_redraw
+}
+functions[_ec_original_refresh]=$functions[_easyCmd_refresh]
+_easyCmd_refresh() {
+  print -r -- "$sysparams[pid]" >> $HOME/workers
+  (( ${EC_TEST_DELAY:-0} )) && sleep "$EC_TEST_DELAY"
+  _ec_original_refresh
+}
+_ec_request_new() {
+  print -s -- 'record MANUAL-NEW'
+  _easyCmd_refresh_request
+}
+zle -N _ec_request_new
+bindkey -M main '^Xr' _ec_request_new
+bindkey -M viins '^Xr' _ec_request_new
+'''
+
+
+def async_wait(s, revision=1):
+    deadline = time.monotonic() + 5
+    target = s.home / 'cache-ready'
+    while not target.exists() or int(target.read_text()) < revision:
+        assert time.monotonic() < deadline, 'background cache did not finish'
+        s.read(.02)
+    s.read(.05)
+
+
+def async_typing(s):
+    s.send('record MANUAL', .02)
+    started = time.monotonic()
+    assert probe(s) == 'record MANUAL'
+    assert time.monotonic() - started < .55, 'input waited for background work'
+    assert (s.home/'async-state').read_text().splitlines()[1] == '0'
+    async_wait(s)
+    assert probe(s) == 'record MANUAL'
+    assert listed(s), 'completed cache must refresh the unchanged query'
+    assert not (s.home/'executed').exists()
+    assert b'bad file descriptor' not in s.raw.lower()
+
+
+run('async: delayed first refresh accepts typing before history is ready',
+    'omz', ASYNC_PROBE+'\nEC_TEST_DELAY=0.8\n', async_typing)
+
+
+def async_superseded(s):
+    s.send(b'\x18r\x18r', .02)
+    assert probe(s) == ''
+    assert (s.home/'async-state').read_text().splitlines()[1] == '0'
+    async_wait(s)
+    probe(s)
+    state = (s.home/'async-state').read_text().splitlines()
+    assert state[1] == '1', 'an obsolete snapshot was published'
+    assert state[2] == '', 'completed descriptor leaked'
+    assert (s.home/'cache-contents').read_text().splitlines()[0] == 'record MANUAL-NEW'
+    assert len((s.home/'workers').read_text().splitlines()) == 2, 'requests were not coalesced'
+
+
+run('async: overlapping requests publish only the latest history snapshot',
+    'omz', ASYNC_PROBE+'\nEC_TEST_DELAY=0.6\n', async_superseded)
+
+
+def async_selection(s):
+    async_wait(s)
+    s.send('record MANUAL', .05)
+    s.send(b'\x18r', .02)
+    s.send(b'\x1b[B', .05)
+    typed = probe(s)
+    old_result = listed(s)
+    old_selection = s.snapshot('selected-before-refresh')['selected_rows']
+    selected_command = next(line[3:] for row, line in old_result if row == old_selection[0])
+    async_wait(s, 2)
+    assert probe(s) == typed
+    assert listed(s) == old_result
+    assert s.snapshot('selected-after-refresh')['selected_rows'] == old_selection
+    assert (s.home/'cache-contents').read_text().splitlines()[0] == 'record MANUAL-NEW'
+    s.send(b'\t', .05)
+    assert probe(s) == selected_command
+    assert not (s.home/'executed').exists()
+
+
+run('async: new cache preserves the selected item and Tab accepts that same item',
+    'omz', ASYNC_PROBE+'\nEC_TEST_DELAY=0.6\n', async_selection)
+
+
+PARTIAL_REFRESH = r'''
+_ec_partial_refresh() {
+  _easyCmd_refresh_close
+  (( ++_easyCmd_refresh_generation ))
+  _easyCmd_refresh_started=$_easyCmd_refresh_generation
+  exec {_easyCmd_refresh_fd}< <(print -rn -- 'incomplete snapshot'; sleep 0.3)
+  zle -F "$_easyCmd_refresh_fd" _easyCmd_refresh_ready
+}
+zle -N _ec_partial_refresh
+bindkey -M main '^Xp' _ec_partial_refresh
+bindkey -M viins '^Xp' _ec_partial_refresh
+_ec_stderr() { print -u2 -- 'ASYNC_STDERR_ALIVE'; }
+zle -N _ec_stderr
+bindkey -M main '^Xe' _ec_stderr
+bindkey -M viins '^Xe' _ec_stderr
+'''
+
+
+def async_partial(s):
+    async_wait(s)
+    probe(s)
+    previous = (s.home/'cache-contents').read_bytes()
+    s.send(b'\x18p', .01)
+    s.send('record MANUAL', .01)
+    assert probe(s) == 'record MANUAL'
+    s.read(.35)
+    assert probe(s) == 'record MANUAL'
+    assert (s.home/'cache-contents').read_bytes() == previous
+    state = (s.home/'async-state').read_text().splitlines()
+    assert state[1:3] == ['1', ''], 'truncated output was committed or descriptor leaked'
+    s.send(b'\x18e', .05)
+    assert b'ASYNC_STDERR_ALIVE' in s.raw, 'cleanup redirected shell stderr'
+
+
+run('async: partial output never blocks typing or replaces a complete cache',
+    'omz', ASYNC_PROBE+PARTIAL_REFRESH, async_partial)
+
+
+def async_interrupt(s):
+    for _ in range(4):
+        s.send(b'\x03', .04)
+    s.send('record MANUAL', .02)
+    assert probe(s) == 'record MANUAL'
+    async_wait(s)
+    assert probe(s) == 'record MANUAL'
+    assert listed(s)
+    assert not (s.home/'executed').exists()
+    assert (s.home/'async-state').read_text().splitlines()[2] == ''
+
+
+run('async: repeated Ctrl-C recovers and leaves no active cache descriptor',
+    'omz', ASYNC_PROBE+'\nEC_TEST_DELAY=0.6\n', async_interrupt)
+
+
+def async_commands(s):
+    for index in range(4):
+        s.send(f'record FAST-{index}\r', .04)
+    async_wait(s)
+    assert (s.home/'executed').read_text().splitlines() == [f'FAST-{i}' for i in range(4)]
+    assert probe(s) == ''
+    assert (s.home/'async-state').read_text().splitlines()[2] == ''
+    s.read(.7)
+    workers = (s.home/'workers').read_text().splitlines()
+    assert all(not Path('/proc', pid).exists() for pid in workers), 'background worker leaked'
+    assert not re.search(rb'(write error|bad file descriptor)', s.raw.lower())
+
+
+run('async: rapid commands execute once and canceled workers exit',
+    'omz', ASYNC_PROBE+'\nEC_TEST_DELAY=0.6\n', async_commands)
+
+
+LARGE_ASYNC_HISTORY = r'''
+fc -p $HOME/large-async-history 10000
+for n in {1..2500}; do print -s -- "record item-$n-${(l:80::x:)}"; done
+print -s -- 'record 中文 $HOME $(false) `false` [a]*? \\ tail  '
+print -s -- 'record duplicate'
+print -s -- 'record duplicate'
+print -s -- $'record multiline\nnot-a-separate-command'
+_ec_original_refresh
+print -rl -- "${_easyCmd_cache[@]}" > $HOME/expected-cache
+_easyCmd_cache=()
+'''
+
+
+def async_large(s):
+    async_wait(s)
+    probe(s)
+    expected = (s.home/'expected-cache').read_bytes()
+    assert len(expected) > 65536
+    assert (s.home/'cache-contents').read_bytes() == expected, 'pipe changed historical text or order'
+    assert not (s.home/'executed').exists()
+    assert (s.home/'async-state').read_text().splitlines()[2] == ''
+
+
+run('async: multi-chunk pipe preserves Unicode, literal shell text and exact ordering',
+    'omz', ASYNC_PROBE+LARGE_ASYNC_HISTORY, async_large)
+
+
+def async_fallback(s):
+    assert probe(s) == ''
+    assert int((s.home/'async-state').read_text().splitlines()[0]) > 0
+    s.send('record MANUAL', .05)
+    assert listed(s)
+
+
+run('async: missing system module keeps synchronous history functionality',
+    'vi', ASYNC_PROBE+'\n_easyCmd_async_available=0\n', async_fallback)
 
 report = {
     'plugin': PLUGIN,

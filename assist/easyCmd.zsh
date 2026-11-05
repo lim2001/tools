@@ -19,10 +19,11 @@
 #
 # 匹配决定是否入选；全部候选统一按最后使用顺序排列，最近使用的在前。
 # 前缀、子串和模糊匹配不分排序优先级，命令长短平权，不统计频次。
+# 完整历史缓存后台构建；就绪后原子更新，不改动正在编辑的文字和选中项。
 
 [[ -o interactive && -o zle ]] || return 0
-(( ${_EASYCMD_VERSION:-0} >= 27 )) && return 0
-typeset -g _EASYCMD_VERSION=27
+(( ${_EASYCMD_VERSION:-0} >= 28 )) && return 0
+typeset -g _EASYCMD_VERSION=28
 zmodload zsh/parameter
 zmodload zsh/zleparameter
 zmodload zsh/zselect
@@ -107,6 +108,10 @@ typeset -ga _easyCmd_cache=() _easyCmd_result=() _easyCmd_hits=()
 typeset -ga _easyCmd_qpat=() _easyCmd_qchr=() _easyCmd_toks=()
 typeset -g _easyCmd_cand='' _easyCmd_first=0 _easyCmd_span=0
 typeset -g _easyCmd_sc=0 _easyCmd_wn=0 _easyCmd_wv=0
+typeset -gi _easyCmd_async_available=0 _easyCmd_refresh_generation=0
+typeset -gi _easyCmd_refresh_started=0 _easyCmd_cache_revision=0 _easyCmd_query_revision=-1
+typeset -g _easyCmd_refresh_fd='' _easyCmd_refresh_buffer=''
+zmodload zsh/system 2>/dev/null && _easyCmd_async_available=1
 
 # zsh 自己读取 HISTFILE；这里只取内存历史，保持命令的引号和空白原样。
 # 不拆多行命令，避免把其中一行误当成独立可执行的历史项。
@@ -127,6 +132,109 @@ _easyCmd_refresh() {
     _easyCmd_cache+=("$cmd")
   done
   _easyCmd_query=$'\0'
+  return 0
+}
+
+# 历史只在子进程的内存快照中整理；不执行历史文本、不写临时历史文件。
+# 同时最多一个任务。期间的新请求合并，旧快照不会覆盖较新的请求。
+_easyCmd_refresh_close() {
+  emulate -L zsh
+  if [[ -n $_easyCmd_refresh_fd ]]; then
+    zle -F "$_easyCmd_refresh_fd" 2>/dev/null
+    { exec {_easyCmd_refresh_fd}<&- } 2>/dev/null
+  fi
+  _easyCmd_refresh_fd=''
+  _easyCmd_refresh_buffer=''
+  return 0
+}
+
+_easyCmd_refresh_start() {
+  emulate -L zsh
+  _easyCmd_refresh_started=$_easyCmd_refresh_generation
+  _easyCmd_refresh_buffer=''
+  if ! exec {_easyCmd_refresh_fd}< <(
+    _easyCmd_refresh || exit 1
+    (( ${#_easyCmd_cache} )) && print -rl -- "${_easyCmd_cache[@]}"
+    # 过滤后的历史不含控制字符；NUL 仅作为整份结果完成的标记。
+    print -rn -- $'\0'
+  ); then
+    _easyCmd_refresh_fd=''
+    return 1
+  fi
+  zle -F "$_easyCmd_refresh_fd" _easyCmd_refresh_ready || {
+    _easyCmd_refresh_close
+    return 1
+  }
+}
+
+_easyCmd_refresh_request() {
+  emulate -L zsh
+  (( ++_easyCmd_refresh_generation ))
+  [[ -n $_easyCmd_refresh_fd ]] && return 0
+  if (( _easyCmd_async_available )) && _easyCmd_refresh_start; then
+    return 0
+  fi
+  # 缺少异步模块或描述符不足时仍可用，回退到原有的同步行为。
+  _easyCmd_refresh
+  (( ++_easyCmd_cache_revision ))
+  return 0
+}
+
+_easyCmd_refresh_ready() {
+  emulate -L zsh
+  local fd=$1 chunk payload
+  local -i rc attempt complete=0 started=$_easyCmd_refresh_started
+  [[ $fd == "$_easyCmd_refresh_fd" ]] || return 0
+  if [[ -n $2 && $2 != hup ]]; then
+    _easyCmd_refresh_close
+    (( started != _easyCmd_refresh_generation )) && _easyCmd_refresh_start
+    return 0
+  fi
+  # 只读取已经到达的数据；限制单次处理量，绝不等待子进程输出。
+  for attempt in {1..4}; do
+    chunk=''
+    sysread -i "$fd" -s 65536 -t 0 chunk
+    rc=$?
+    if (( rc == 0 )); then
+      _easyCmd_refresh_buffer+=$chunk
+      if [[ $_easyCmd_refresh_buffer == *$'\0' ]]; then
+        complete=1
+        break
+      fi
+    elif (( rc == 4 )); then
+      return 0
+    else
+      # EOF/错误但没有完成标记：保留上一份完整缓存。
+      _easyCmd_refresh_close
+      (( started != _easyCmd_refresh_generation )) && _easyCmd_refresh_start
+      return 0
+    fi
+  done
+  (( complete )) || return 0
+  payload=${_easyCmd_refresh_buffer%$'\0'}
+  _easyCmd_refresh_close
+  if (( started != _easyCmd_refresh_generation )); then
+    _easyCmd_refresh_start
+    return 0
+  fi
+  payload=${payload%$'\n'}
+  if [[ -n $payload ]]; then
+    _easyCmd_cache=("${(@f)payload}")
+  else
+    _easyCmd_cache=()
+  fi
+  (( ++_easyCmd_cache_revision ))
+  # 用户选中的列表保持原样，直到改写查询或进入下一行。
+  zle easyCmd-cache-ready 2>/dev/null
+  return 0
+}
+
+_easyCmd_refresh_redraw() {
+  (( _easyCmd_active && ! _easyCmd_busy && ! _easyCmd_engaged &&
+     ! _easyCmd_pinned && ! _easyCmd_preview )) || return 0
+  [[ $_easyCmd_base != vicmd && $KEYMAP == easyCmd-map-* ]] || return 0
+  _easyCmd_compose
+  zle -R
   return 0
 }
 # 维度注册：$1=维度名  $2=默认权重
@@ -297,7 +405,8 @@ _easyCmd_score() {
   _easyCmd_first=$first
   _easyCmd_span=$(( last - first + 1 ))
 
-  _easyCmd_score_impl                # 编译好的评分函数：把所有维度跑一遍
+  # 紧凑子序列筛选只需要命中位置和跨度，不计算排序已不再使用的分数。
+  [[ $2 == span-only ]] || _easyCmd_score_impl
   return 0
 }
 
@@ -325,7 +434,16 @@ _easyCmd_build() {
   _easyCmd_toks=(${=q})
   _easyCmd_wm_cand=$'\0'
   pat="*${(j:*:)_easyCmd_qpat}*"
-  for cand in "${_easyCmd_cache[@]}"; do
+  # 内置数组匹配在 C 层筛选，避免对每条历史执行 shell 分支。
+  # 连续子串也是子序列；预筛选不会漏掉原有的精确或模糊结果。
+  # 连续匹配必须先判断；长输入含大量重复字符时可避免子序列模式回溯。
+  local filter="(*${(b)q}*|${pat})"
+  local -a candidates=("${(@M)_easyCmd_cache:#${~filter}}")
+  if (( ${#_easyCmd_toks} > 1 || ${#q} == 1 )); then
+    _easyCmd_result=("${candidates[@]}")
+    return 0
+  fi
+  for cand in "${candidates[@]}"; do
     if [[ $cand == *"$q"* ]]; then
       _easyCmd_result+=("$cand")
     elif [[ $cand == ${~pat} ]]; then
@@ -335,7 +453,7 @@ _easyCmd_build() {
       elif (( ${#q} >= EASYCMD_FUZZY_MIN_LEN &&
               loose_count < EASYCMD_FUZZY_MAX && ++loose_checked <= EASYCMD_LOOSE_LIMIT )); then
         # 单词的松散子序列仍需足够紧凑；预算只限制这一类的检查和数量。
-        _easyCmd_score "$cand" || continue
+        _easyCmd_score "$cand" span-only || continue
         (( _easyCmd_span <= ${#q} + EASYCMD_SPAN_SLACK )) || continue
         _easyCmd_result+=("$cand")
         (( ++loose_count ))
@@ -426,8 +544,10 @@ _easyCmd_update() {
     [[ $BUFFER == "$_easyCmd_suppressed" ]] && { _easyCmd_shown=(); return 0; }
     _easyCmd_closed=0
   fi
-  if (( ! _easyCmd_pinned )) && [[ $BUFFER != "$_easyCmd_query" ]]; then
+  if (( ! _easyCmd_pinned )) && { [[ $BUFFER != "$_easyCmd_query" ]] ||
+      (( ! _easyCmd_engaged && ! _easyCmd_preview && _easyCmd_query_revision != _easyCmd_cache_revision )); }; then
     _easyCmd_query=$BUFFER
+    _easyCmd_query_revision=$_easyCmd_cache_revision
     _easyCmd_build "$BUFFER"
     _easyCmd_hover=1
     _easyCmd_top=1
@@ -971,6 +1091,8 @@ _easyCmd_select() {
 }
 
 _easyCmd_finish() {
+  # 关闭读端后，未完成的后台写入会退出；不会随下一条命令积累任务。
+  _easyCmd_refresh_close
   _easyCmd_preview=0
   _easyCmd_pinned=0
   _easyCmd_recent=0
@@ -1014,7 +1136,7 @@ _easyCmd_precmd() {
   _easyCmd_active=0
   _easyCmd_suffix=''
   _easyCmd_shown=()
-  _easyCmd_refresh
+  _easyCmd_refresh_request
   if (( ${+functions[_zsh_autosuggest_highlight_apply]} )) &&
      [[ ${functions[_zsh_autosuggest_highlight_apply]} != *'_easyCmd_suggest_highlight'* ]]; then
     functions[_easyCmd_original_suggest_highlight]=$functions[_zsh_autosuggest_highlight_apply]
@@ -1032,12 +1154,14 @@ _easyCmd_precmd() {
   zle -N easyCmd-history-down _easyCmd_history_key
   zle -N easyCmd-mouse _easyCmd_mouse
   zle -N easyCmd-cursor-report _easyCmd_cursor_report
+  zle -N easyCmd-cache-ready _easyCmd_refresh_redraw
   add-zle-hook-widget line-init _easyCmd_init
   add-zle-hook-widget line-pre-redraw _easyCmd_draw
   add-zle-hook-widget line-finish _easyCmd_finish
   add-zle-hook-widget keymap-select _easyCmd_select
   zmodload zsh/terminfo
   add-zsh-hook precmd _easyCmd_precmd
+  add-zsh-hook zshexit _easyCmd_refresh_close
   # 私有包装器必须在 autosuggestions 外层，建议插件只包装被委托的原生部件。
   if (( ${+ZSH_AUTOSUGGEST_IGNORE_WIDGETS} )); then
     ZSH_AUTOSUGGEST_IGNORE_WIDGETS+=( 'easyCmd-*' 'easyCmd-*' '_easyCmd_*' )
@@ -1047,4 +1171,5 @@ _easyCmd_precmd() {
 easyCmd-diag() {
   print -r -- "easyCmd v$_EASYCMD_VERSION; zsh $ZSH_VERSION; ${COLUMNS}x${LINES}"
   print -r -- "cached=${#_easyCmd_cache}; max_show=$EASYCMD_MAX_SHOW; renderer=ZLE; mouse=auto"
+  print -r -- "history_limit=$EASYCMD_MAX_HIST; async=$_easyCmd_async_available; refreshing=$(( ${#_easyCmd_refresh_fd} > 0 ))"
 }
